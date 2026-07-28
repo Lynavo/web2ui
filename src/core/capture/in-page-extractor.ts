@@ -36,9 +36,10 @@ export interface InPageAssetRequest {
   naturalWidth?: number;
   naturalHeight?: number;
   /**
-   * CSS mask 图标的着色事实：形状来自 mask 图（alpha 通道），颜色来自
-   * 元素背景色。engine 下载 SVG 后按此色染色固化为普通图像资产，
-   * 下游渲染端无需理解 mask。
+   * Tint fact for CSS mask icons. The shape comes from the mask image's alpha
+   * channel and the color comes from the element background. After downloading
+   * the SVG, the engine bakes in this color as a regular image asset so
+   * downstream renderers do not need to understand masks.
    */
   tint?: string;
 }
@@ -210,7 +211,8 @@ export async function extractCaptureInPage(
     kind: "raster-image" | "svg-image",
     tint?: string,
   ): string {
-    // 同一 mask 图不同着色是不同资产（key 含 tint）；普通图片 key 即 url。
+    // Different tints of the same mask are distinct assets (the key includes
+    // the tint); regular images use the URL as their key.
     const key = tint === undefined ? url : `${url}\u0000${tint}`;
     const existing = assetIdByUrl.get(key);
     if (existing !== undefined) {
@@ -861,16 +863,18 @@ export async function extractCaptureInPage(
                 naturalSize.naturalHeight,
               );
             } else {
-              // 初始 kind 仅是提示：engine 下载后会按响应 Content-Type
-              // （事实）覆盖。路径判定需容忍 query/hash 后缀。
+              // The initial kind is only a hint. After download, the engine
+              // replaces it with the response Content-Type fact. Path matching
+              // must tolerate query and hash suffixes.
               assetId = registerRemoteAsset(
                 resolved,
                 /\.svg([?#]|$)/i.test(resolved) ? "svg-image" : "raster-image",
               );
             }
             const sizeValue = valueForBackgroundLayer(backgroundSizes, index, "auto");
-            // background-repeat 测量事实（每层）。计算样式已归一为
-            // "repeat" / "no-repeat" / "repeat-x" / "repeat-y" / "repeat no-repeat" 等。
+            // Measured background-repeat fact for each layer. Computed styles
+            // normalize values such as "repeat", "no-repeat", "repeat-x",
+            // "repeat-y", and "repeat no-repeat".
             const repeatRaw = valueForBackgroundLayer(
               backgroundRepeats,
               index,
@@ -897,10 +901,12 @@ export async function extractCaptureInPage(
             const positionY = parseBackgroundPositionAxis(
               valueForBackgroundLayer(backgroundPositionsY, index, "0%"),
             );
-            // background-size 的长度/百分比是浏览器样式事实；百分比以
-            // 当前 background positioning area（这里即捕获盒）解析成 px，
-            // 让下游可用资产固有尺寸求 TILE scalingFactor。此前只保留 px，
-            // `background-size:100%` 会退成原尺寸平铺并把大 SVG 裁成一角。
+            // Background-size lengths and percentages are browser style facts.
+            // Resolve percentages to pixels against the current background
+            // positioning area (the captured box here), allowing downstream
+            // consumers to derive TILE scalingFactor from intrinsic asset size.
+            // Without this fact, `background-size: 100%` falls back to tiling at
+            // intrinsic size and crops a large SVG to one corner.
             const sizeTokens = sizeValue.trim().split(/\s+/);
             const resolveBackgroundSizeAxis = (token: string | undefined, boxSize: number): number => {
               if (token === undefined) return 0;
@@ -956,9 +962,10 @@ export async function extractCaptureInPage(
       }
     }
 
-    // CSS mask 图标：形状由 mask-image 剪出，颜色是元素背景色。仅处理
-    // "纯色填充 + 单 url mask" 的图标模式 —— 把纯色替换为染色后的
-    // mask 图资产（engine 侧完成染色），其余 mask 用法保留原样并告警。
+    // CSS mask icons derive shape from mask-image and color from the element
+    // background. Handle only the "solid fill + single URL mask" icon pattern:
+    // replace the solid color with a tinted mask image asset (tinted by the
+    // engine). Preserve other mask usages and emit a warning.
     const maskImage =
       style.getPropertyValue("mask-image") || style.getPropertyValue("-webkit-mask-image");
     if (maskImage && maskImage !== "none") {
@@ -970,7 +977,7 @@ export async function extractCaptureInPage(
         let assetId: string | null = null;
         let naturalSize: { naturalWidth?: number; naturalHeight?: number } = {};
         if (rawUrl.startsWith("data:image/svg")) {
-          // data: URI 的 SVG mask 直接在页面内解码染色，无需下载。
+          // Decode and tint data URI SVG masks in-page without a download.
           const svgText = decodeSvgDataUri(rawUrl);
           if (svgText !== null) {
             naturalSize = parseSvgNaturalSize(rawUrl);
@@ -1006,7 +1013,7 @@ export async function extractCaptureInPage(
     return fills;
   }
 
-  /** data:image/svg+xml URI（base64 或 percent-encoded）→ SVG 文本。 */
+  /** Decode a base64 or percent-encoded data:image/svg+xml URI to SVG text. */
   function decodeSvgDataUri(uri: string): string | null {
     try {
       const comma = uri.indexOf(",");
@@ -1022,8 +1029,9 @@ export async function extractCaptureInPage(
   }
 
   /**
-   * 单色图标染色：mask 的形状语义是 alpha 通道，可见部分统一着 tint 色。
-   * 将 currentColor 与所有非 none 的 fill 替换为 tint，并确保根元素有 fill。
+   * Tint a monochrome icon. A mask's shape is defined by its alpha channel, so
+   * all visible pixels receive the tint. Replace currentColor and every fill
+   * other than none with the tint, and ensure that the root element has a fill.
    */
   function tintSvgMarkup(svg: string, tint: string): string {
     let out = svg
@@ -1816,8 +1824,9 @@ export async function extractCaptureInPage(
       lineHeightPx,
       letterSpacingPx: letterSpacing,
       color: parseColorOpaque(style.color),
-      // start/end 是逻辑值：解析需要 direction 事实（RTL 时 start=right）。
-      // 显式 left/right/center/justify 是物理值，与 direction 无关。
+      // start/end are logical values and require the measured direction fact
+      // (start means right in RTL). Explicit left/right/center/justify values
+      // are physical and independent of direction.
       textAlign:
         align === "left" || align === "center" || align === "right" || align === "justify"
           ? align
@@ -1850,9 +1859,9 @@ export async function extractCaptureInPage(
   }
 
   /**
-   * overflow 值是否会把内容裁剪到盒内。hidden/clip 显然裁剪；auto/scroll
-   * 是滚动容器 —— 视觉上内容同样被裁剪到滚动口，只是允许用户滚动。
-   * 只有 visible 不裁剪。
+   * Whether an overflow value clips content to the box. hidden and clip
+   * obviously clip; auto and scroll create scroll containers whose content is
+   * also visually clipped to the scrollport. Only visible does not clip.
    */
   function clipsOverflow(value: string): boolean {
     return value === "hidden" || value === "clip" || value === "auto" || value === "scroll";
@@ -2005,11 +2014,13 @@ export async function extractCaptureInPage(
     if (Number.parseFloat(style.opacity) === 0) {
       return false;
     }
-    // 浏览器渲染可见性事实：checkVisibility() 覆盖 computed style 查不到
-    // 的隐藏（收起 <details> 内容的 content-visibility:hidden 等 —— 此时
-    // display/visibility 均为可见值且 rect 仍返回布局坐标）。
-    // display:contents 自身无盒会返回 false，但其子树可见，需排除；
-    // content-visibility:auto 的离屏跳过内容默认不算 hidden，不受影响。
+    // Browser-rendered visibility fact. checkVisibility() detects hidden states
+    // that computed style misses, such as content-visibility:hidden inside a
+    // collapsed <details>, where display/visibility remain visible and rects
+    // still expose layout coordinates. Exclude display:contents because the
+    // element itself has no box even when its subtree is visible.
+    // Offscreen content skipped by content-visibility:auto is not hidden by
+    // default and remains unaffected.
     if (
       style.display !== "contents" &&
       typeof element.checkVisibility === "function" &&
@@ -2180,13 +2191,15 @@ export async function extractCaptureInPage(
     if (parseColor(style.backgroundColor) || style.backgroundImage !== "none") {
       return false;
     }
-    // box-shadow 也是自有 paint：站点常用无模糊偏移阴影画"边框线"
-    // （如 MDN 目录链接的 box-shadow:-2px 0 0 画左侧竖线）。吸收进
-    // 文本 run 会静默丢掉这条线。
+    // box-shadow is also owned paint. Sites often use an unblurred offset
+    // shadow as a border line (for example, box-shadow: -2px 0 0 on an MDN
+    // table-of-contents link). Folding the element into a text run would
+    // silently drop that line.
     if (style.boxShadow !== "none" && style.boxShadow !== "") {
       return false;
     }
-    // 真实边框同理（注释一直声称 borders，此前却从未检查）。
+    // Real borders follow the same rule (the earlier comment claimed this
+    // behavior, but the implementation did not previously check them).
     if (
       (parseFloat(style.borderTopWidth) > 0 && style.borderTopStyle !== "none") ||
       (parseFloat(style.borderRightWidth) > 0 && style.borderRightStyle !== "none") ||
@@ -2916,7 +2929,8 @@ export async function extractCaptureInPage(
       }
       const lines: LineAccumulator[] = [];
       let currentLine: LineAccumulator | null = null;
-      // 行切换阈值：新字符 top 相比当前行 top 下移超过半个行高。
+      // Line transition threshold: the new character's top is more than half a
+      // line height below the current line's top.
       const lineBreakThreshold = Math.max(lineHeightRef * 0.5, firstPiece.style.fontSizePx * 0.5);
 
       for (const piece of pieces) {
@@ -2927,7 +2941,8 @@ export async function extractCaptureInPage(
         for (let i = 0; i < raw.length; i++) {
           const ch = raw[i] ?? "";
           if (isCssCollapsibleWhitespace(ch)) {
-            // 折叠空白：先挂起，由下一个可见字符决定它是空格还是换行。
+            // Defer collapsed whitespace until the next visible character
+            // determines whether it represents a space or a line break.
             pendingWhitespace = true;
             continue;
           }
@@ -2965,7 +2980,8 @@ export async function extractCaptureInPage(
               text: ch,
             };
             lines.push(currentLine);
-            // 行首：挂起的空白折叠进换行本身（CJK 无空格场景不会引入多余空格）。
+            // At line start, fold deferred whitespace into the line break so
+            // scripts without spaces do not gain an extra space.
             rebuilt += rebuilt.length > 0 || lines.length > 1 ? `\n${ch}` : ch;
             pendingWhitespace = false;
           } else {
@@ -2984,7 +3000,8 @@ export async function extractCaptureInPage(
         if (!measurable) {
           continue;
         }
-        // 片段以空白结尾：保留一个空格供下一片段衔接（拉丁词间距）。
+        // When a fragment ends in whitespace, retain one space to preserve word
+        // separation across the next fragment.
         if (pendingWhitespace && rebuilt.length > 0) {
           rebuilt += " ";
           if (currentLine) currentLine.text += " ";
@@ -3089,7 +3106,8 @@ export async function extractCaptureInPage(
       return null;
     }
     // Container-level text-align wins over segment-level (inline align is meaningless).
-    // start/end 是逻辑值：必须结合 direction 事实解析（RTL 时 start=right）。
+    // start/end are logical values and must be resolved using the measured
+    // direction fact (start means right in RTL).
     const containerAlign = containerStyle.textAlign;
     const containerRtl = containerStyle.direction === "rtl";
     const resolvedAlign =
@@ -3108,22 +3126,25 @@ export async function extractCaptureInPage(
     const style: TextStyle = { ...dominant.style, textAlign: resolvedAlign };
 
     const textShadows = extractTextShadows(containerStyle);
-    // 测量事实：方向 / 书写模式 / 换行保留 / background-clip:text 填充。
+    // Measured facts: direction, writing mode, preserved line breaks, and
+    // background-clip:text fills.
     const direction = containerStyle.direction === "rtl" ? ("rtl" as const) : undefined;
     const wm = containerStyle.writingMode;
     const writingMode =
       wm === "vertical-rl" || wm === "vertical-lr" || wm === "sideways-rl" || wm === "sideways-lr"
         ? wm
         : undefined;
-    // text-orientation: upright（CJK 直立列）不能用「横排旋转 90°」模型
-    // 表达——必须记录该事实让下游降级告警而不是错误旋转。
+    // text-orientation: upright cannot be represented by rotating horizontal
+    // text 90 degrees. Record the fact so downstream consumers can warn about
+    // the fallback instead of applying an incorrect rotation.
     const textOrientation =
       writingMode !== undefined && containerStyle.textOrientation === "upright"
         ? ("upright" as const)
         : undefined;
     const preservesNewlines = preservesWhitespace ? true : undefined;
-    // background-clip:text — 直读计算样式事实（不做启发式）：文字用容器
-    // fills 上色，而不是 style.color（往往是 transparent ���黑的根源）。
+    // background-clip:text is read directly from computed style without
+    // heuristics. Text uses the container fills rather than style.color, which
+    // is often transparent and otherwise produces black output.
     let fillClip: { fills: Paint[] } | undefined;
     const bgClip =
       containerStyle.backgroundClip ||
@@ -3283,8 +3304,9 @@ export async function extractCaptureInPage(
       addWarning("asset_fetch_failed", "unresolvable img src", nodeId);
       return { ...base, assetMissing: true };
     }
-    // 初始 kind 仅是提示：engine 按响应 Content-Type（事实）覆盖。
-    // `includes(".svg")` 会误伤 "/design.svg-icons/logo.png" 这类路径。
+    // The initial kind is only a hint; the engine replaces it with the response
+    // Content-Type fact. `includes(".svg")` would misclassify paths such as
+    // "/design.svg-icons/logo.png".
     const kind = /\.svg([?#]|$)/i.test(resolved) ? "svg-image" : "raster-image";
     const assetId = registerRemoteAsset(resolved, kind);
     return { ...base, assetId };
@@ -5159,9 +5181,9 @@ export async function extractCaptureInPage(
       name: layerName(element),
       bounds: toPageRect(rect),
       opacity: Number.parseFloat(style.opacity) || 1,
-      // 裁剪事实：hidden/clip 之外，auto/scroll 滚动容器同样裁剪到滚动口
-      // （MDN 侧边栏这类超长可滚列表若不记为裁剪，下游会把整个滚动内容
-      // 全部绘制，压满页面）。
+      // Clipping fact: auto/scroll containers clip to the scrollport just like
+      // hidden/clip. Without this fact, downstream rendering expands a long
+      // scrollable list such as an MDN sidebar across the entire page.
       clipsContent: clipsBothAxes && !positionedClipEscape,
       fills: nodeFills,
       ...(nodeBorders !== undefined ? { borders: nodeBorders } : {}),
@@ -5197,18 +5219,21 @@ export async function extractCaptureInPage(
     if (style.mixBlendMode && style.mixBlendMode !== "normal") {
       elementNode.mixBlendMode = style.mixBlendMode;
     }
-    // 单轴裁剪事实：clipsContent 只表达双轴；单轴 overflow 单独记录。
+    // Single-axis clipping fact. clipsContent represents two-axis clipping, so
+    // one-axis overflow is recorded separately.
     const clipsX = clipsOverflow(style.overflowX);
     const clipsY = clipsOverflow(style.overflowY);
     if (clipsX !== clipsY) {
       elementNode.clipAxes = { x: clipsX, y: clipsY };
     }
-    // 动画事实：捕获瞬间该元素的计算样式是动画中间帧，不是静息态。
+    // Animation fact: the computed style at capture time represents an
+    // intermediate animation frame rather than the resting state.
     if (style.animationName !== "none" && style.animationPlayState === "running") {
       elementNode.animationState = "running";
     }
-    // 旋转元素：bounds 是变换后 AABB；补记未变换的布局盒尺寸（以 AABB 中心
-    // 对齐），下游按此还原旋转，而不是从 AABB 反解。
+    // For rotated elements, bounds is the transformed AABB. Also record the
+    // untransformed layout box centered on that AABB so downstream consumers
+    // can restore rotation without reverse-solving the AABB.
     if (rotation !== undefined && element instanceof HTMLElement) {
       const lw = element.offsetWidth;
       const lh = element.offsetHeight;
@@ -5223,10 +5248,11 @@ export async function extractCaptureInPage(
         };
       }
     }
-    // inline 元素跨行 fragment 事实：带 paint 的 inline 元素（如 <code>
-    // 芯片）换行时,bounds 是跨行 AABB —— 用它画背景会得到一条横贯整行的
-    // 宽带。el.getClientRects() 是浏览器逐行 fragment 矩形的直接测量，
-    // 仅在 2+ fragment 时记录，下游必须逐 fragment 绘制��景。
+    // Inline fragment fact. When a painted inline element such as a <code> chip
+    // wraps, bounds is an AABB spanning multiple lines; painting that box would
+    // create a wide band across the row. el.getClientRects() directly measures
+    // each browser line fragment. Record it only for two or more fragments so
+    // downstream consumers can paint every fragment separately.
     if (
       style.display === "inline" &&
       (nodeFills.length > 0 || nodeBorders !== undefined)
@@ -5262,14 +5288,17 @@ export async function extractCaptureInPage(
         }
       }
     }
-    // ::marker 提取：列表圆点/序号是浏览器生成的盒，DOM 里不存在。
-    // 类型/颜色/字号读 ::marker 计算样式（测量事实）；outside marker 的
-    // 盒位置无 DOM API，按 CSS 规范 + Chromium UA 常量推导（见函数注释）。
+    // Extract ::marker because list bullets and counters are browser-generated
+    // boxes absent from the DOM. Read type, color, and font size from computed
+    // ::marker style. No DOM API exposes the box position for outside markers,
+    // so derive it from CSS rules and a Chromium UA constant (see the function
+    // documentation).
     const markerNode = walkListMarker(element, rect, style);
     if (markerNode) {
       elementNode.children.push(markerNode);
     }
-    // 伪元素提取：::before 在子节点之前、::after 在之后（近似绘制顺序）。
+    // Extract pseudo-elements with ::before preceding children and ::after
+    // following them as an approximation of paint order.
     const beforeNode = walkPseudoElement(element, rect, "before", style);
     if (beforeNode) {
       elementNode.children.push(beforeNode);
@@ -5504,15 +5533,16 @@ export async function extractCaptureInPage(
   }
 
   /**
-   * 提取列表 ::marker（圆点/序号）为合成节点。
-   *
-   * marker 是浏览器生成的盒，DOM 里不存在、也没有 rect API：
-   * - 字形/颜色/字号：读 getComputedStyle(el, "::marker")（测量事实）
-   * - 盒位置：CSS 规范推导 —— outside marker 的 inline-end 缘距 li
-   *   content 盒 inline-start 缘一个 UA 间距（Chromium kCMarkerPaddingPx
-   *   = 7px），与首行行盒对齐。这是 UA 布局常量，不是内容形态猜测。
-   * list-style-image 使用 ::marker 的计算宽高和实际资产 URL，避免用字体
-   * 或内容形态猜测图片标记尺寸。
+   * Extract a list ::marker (bullet or counter) as a synthetic node.
+ *
+   * A marker is a browser-generated box with no DOM node or rect API:
+   * - Read glyph, color, and font size from getComputedStyle(el, "::marker").
+   * - Derive box position from CSS rules. The outside marker's inline-end edge
+   *   sits one UA gap before the li content box's inline-start edge and aligns
+   *   with the first line box. Chromium kCMarkerPaddingPx is 7px. This is a UA
+   *   layout constant, not an inference from content shape.
+   * For list-style-image, use the computed ::marker size and actual asset URL
+   * instead of guessing image marker dimensions from font or content shape.
    */
   function walkListMarker(
     element: Element,
@@ -5616,7 +5646,7 @@ export async function extractCaptureInPage(
         pseudo: "marker",
       };
     }
-    // 字形：符号类直接映射；序号类按同级 li 序数生成。
+    // Map symbolic glyphs directly; generate counters from the sibling li index.
     const SYMBOL_GLYPHS: Record<string, string> = {
       disc: "•",
       circle: "◦",
@@ -5625,8 +5655,9 @@ export async function extractCaptureInPage(
     let glyph = SYMBOL_GLYPHS[listType];
     if (glyph === undefined) {
       if (listType !== "decimal") {
-        // 其他序号体系（lower-alpha/lower-roman/CJK 计数等）未实现 ——
-        // 显式告警而不是静默丢失保真。
+        // Other counter systems (lower-alpha, lower-roman, locale-specific
+        // counters, and so on) are not implemented. Warn explicitly instead of
+        // silently losing fidelity.
         addWarning("marker_type_skipped", listType);
         return null;
       }
@@ -5654,7 +5685,7 @@ export async function extractCaptureInPage(
     if (markerColor) {
       textStyle.color = markerColor;
     }
-    // 宽度：canvas measureText 用 ::marker 同字体实测字形宽。
+    // Measure glyph width with canvas measureText using the ::marker font.
     const glyphWidth = measureGlyphWidth(glyph, ms);
     const contentLeft =
       rect.left + parsePx(style.borderLeftWidth) + parsePx(style.paddingLeft);
@@ -5700,7 +5731,7 @@ export async function extractCaptureInPage(
   }
 
   let glyphMeasureContext: CanvasRenderingContext2D | null = null;
-  /** canvas measureText 实测字形宽（同字体同字号，测量事实）。 */
+  /** Measure glyph width with canvas measureText using the same font and size. */
   function measureGlyphWidth(glyph: string, ms: CSSStyleDeclaration): number {
     try {
       if (!glyphMeasureContext) {
@@ -5897,14 +5928,18 @@ export async function extractCaptureInPage(
   }
 
   /**
-   * 提取 CSS 伪元素（::before/::after）为合成节点。
-   *
-   * 伪元素没有 getBoundingClientRect，bounds 由计算样式的 px 事实推得：
-   * - absolute/fixed 定位：由 inset/width/height 相对父盒解析
-   * - scroll container 的 block ::after bottom-sticky：仅当直接 normal-flow
-   *   内容可由静态 block 盒无歧义确定时，按底部 inset 解析
-   * - 其余场景：只有当 width/height 是确定 px 值时才发射
-   * 解析不出确定尺寸且无文本内容时放弃（记警告）��绝不猜。
+   * Extract CSS pseudo-elements (::before/::after) as synthetic nodes.
+ *
+   * Pseudo-elements do not expose getBoundingClientRect, so derive bounds from
+   * pixel-valued computed style facts:
+   * - Resolve absolute/fixed positioning from inset/width/height against the
+   *   parent box.
+   * - Resolve a bottom-sticky block ::after in a scroll container from its
+   *   bottom inset only when direct normal-flow content is unambiguously
+   *   determined by static block boxes.
+   * - In other cases, emit only when width and height are definite pixel values.
+   * If no definite size can be resolved and there is no text, skip the node,
+   * record a warning, and never guess.
    */
   function parseGeneratedContentText(value: string): string {
     let index = 0;
@@ -6230,7 +6265,7 @@ export async function extractCaptureInPage(
       const rightAuto = ps.right === "auto";
       const topAuto = ps.top === "auto";
       const bottomAuto = ps.bottom === "auto";
-      // 宽度：优先 px width；否则由 left+right 撑满。
+      // Prefer a pixel width; otherwise stretch between left and right.
       const resolvedW =
         w > 0 ? w : !leftAuto && !rightAuto ? Math.max(0, parentRect.width - left - right) : 0;
       const resolvedH =
@@ -6254,8 +6289,10 @@ export async function extractCaptureInPage(
         bounds = { x: x + scrollX, y: y + scrollY, width: resolvedW, height: resolvedH };
       }
     } else if (w > 0 && h > 0) {
-      // in-flow 伪元素：主轴位置由 CSS 布局规则推导（不是贴 border-box 边缘）。
-      // ::before/::after 参与父盒 content-box 布局，必须先扣除 border+padding。
+      // For in-flow pseudo-elements, derive the main-axis position from CSS
+      // layout rules rather than attaching it to the border-box edge.
+      // ::before/::after participate in the parent's content-box layout, so
+      // subtract border and padding first.
       const padLeft = parentStyle !== undefined ? parsePx(parentStyle.paddingLeft) : 0;
       const padRight = parentStyle !== undefined ? parsePx(parentStyle.paddingRight) : 0;
       const borderLeft = parentStyle !== undefined ? parsePx(parentStyle.borderLeftWidth) : 0;
@@ -6289,11 +6326,11 @@ export async function extractCaptureInPage(
           : contentLeft + parsePx(ps.marginLeft) + relativeX;
       }
       if (which === "after" && isRowFlex) {
-        // 行向 flex 里 ::after 是最后一个 flex item。起始堆叠
-        // （justify-content: normal/flex-start）时它排在最后一个 in-flow
-        // 子盒之后加 column-gap —— 子盒矩形是真实布局事实，直接读取。
-        // 其他 justify-content（flex-end/space-between 等）最后一项贴
-        // content-box 右缘，维持上面的默认值。
+        // In a row flex container, ::after is the final flex item. With
+        // start-aligned stacking (justify-content: normal/flex-start), place it
+        // after the final in-flow child plus column-gap. Child rects are direct
+        // layout facts. For other justify-content values such as flex-end or
+        // space-between, keep the default at the content-box end edge.
         const jc = parentStyle.justifyContent;
         if (jc === "normal" || jc === "flex-start" || jc === "start" || jc === "left") {
           let lastRight = contentLeft;
@@ -6307,10 +6344,11 @@ export async function extractCaptureInPage(
           x = lastRight + (Number.isFinite(colGap) ? colGap : 0);
         }
       }
-      // 父容器是行向 flex 时伪元素是真实 flex item，交叉轴位置由
-      // align-items/align-self 决定（CSS 布局规则推导，不是内容猜测）。
-      // 此前一律贴 parentRect.top，导致居中图标（如 MDN 顶栏 chevron）
-      // 在高按钮里贴顶。
+      // In a row flex parent, the pseudo-element is a real flex item whose
+      // cross-axis position follows align-items/align-self. This is a CSS layout
+      // derivation, not a content guess. Always attaching it to parentRect.top
+      // made centered icons such as an MDN header chevron stick to the top of a
+      // tall button.
       const contentTop =
         parentRect.top +
         (parentStyle !== undefined ? parsePx(parentStyle.borderTopWidth) : 0) +
@@ -6372,7 +6410,8 @@ export async function extractCaptureInPage(
         }
         return null;
       }
-      // 纯文本伪元素（如 content:"→"）：字宽由浏览器 canvas 按同字体实测。
+      // For a text-only pseudo-element such as content: "→", measure glyph width
+      // in browser canvas with the same font.
       const textStyle = extractTextStyle(ps);
       const approxW = Math.min(parentRect.width, measureGlyphWidth(contentText, ps));
       const x =
@@ -7014,7 +7053,8 @@ export async function extractCaptureInPage(
     }
   }
 
-  // 当前视口模式：裁掉视口外节点，并把所有浏览器测量事实重基准到视口左上角。
+  // Visible-area mode clips nodes outside the viewport and rebases every
+  // browser-measured fact to the viewport's top-left corner.
   const viewportClip = validViewportClip(options.viewportClip);
   if (viewportClip && rootNode && rootNode.type === "element") {
     rootNode = retainViewportContributors(rootNode, viewportClip, true) as CaptureElementNode;

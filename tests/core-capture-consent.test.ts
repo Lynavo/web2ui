@@ -30,9 +30,9 @@ describe("consent overlay sanitizer", () => {
             padding: 18px;
           "
         >
-          <p>我们利用 Cookie 来提升您的体验并优化营销。阅读我们的 Cookie 政策。</p>
-          <button>全部接受</button>
-          <button>全部拒绝</button>
+          <p>We use cookies to improve your experience and understand product usage.</p>
+          <button>Accept all</button>
+          <button>Reject all</button>
         </section>
       `);
 

@@ -908,7 +908,8 @@ function isPaint(value: unknown): value is Paint {
   }
   if (candidate.type === "radial-gradient") {
     const paint = candidate as Partial<RadialGradientPaint>;
-    // 中心可在盒外（CSS 事实，如 `at 50% 120%`）—— 只要求有限数。
+    // The center may lie outside the box (a CSS fact such as `at 50% 120%`);
+    // only finite values are required.
     return (
       isFiniteNumber(paint.centerX) &&
       isFiniteNumber(paint.centerY) &&

@@ -44,9 +44,9 @@ export function hideConsentOverlaysInPage(): ConsentOverlaySanitizerResult {
     "[id^='sp_message_container_']",
   ];
   const consentTextRe =
-    /\b(cookie|cookies|consent|privacy|gdpr|ccpa)\b|Cookie|隐私|个人信息|个人数据|数据保护|追踪|营销/u;
+    /\b(cookie|cookies|consent|privacy|gdpr|ccpa)\b|Cookie|\u9690\u79c1|\u4e2a\u4eba\u4fe1\u606f|\u4e2a\u4eba\u6570\u636e|\u6570\u636e\u4fdd\u62a4|\u8ffd\u8e2a|\u8425\u9500/u;
   const consentActionRe =
-    /\b(accept|agree|allow|reject|decline|manage|settings|preferences|continue|got it|understand)\b|全部接受|全部拒绝|接受|拒绝|同意|允许|管理|设置|偏好|了解/u;
+    /\b(accept|agree|allow|reject|decline|manage|settings|preferences|continue|got it|understand)\b|\u5168\u90e8\u63a5\u53d7|\u5168\u90e8\u62d2\u7edd|\u63a5\u53d7|\u62d2\u7edd|\u540c\u610f|\u5141\u8bb8|\u7ba1\u7406|\u8bbe\u7f6e|\u504f\u597d|\u4e86\u89e3/u;
 
   const candidates = collectConsentOverlayCandidates();
   let hiddenCount = 0;

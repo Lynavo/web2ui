@@ -194,7 +194,7 @@ interface ConversionContext {
   emitAutoLayout: boolean;
   assetsById: Map<string, CaptureDocument["assets"][number]>;
   usedAssetIds: Set<string>;
-  /** 被 IMAGE fill 引用的资产（SVG 也必须随 plan 携带字节，见 buildAssets）。 */
+  /** Assets referenced by IMAGE fills. SVG bytes must also travel with the plan. */
   fillAssetIds: Set<string>;
   warnings: CaptureWarning[];
   nodeSequence: number;
@@ -203,10 +203,12 @@ interface ConversionContext {
   /** family -> set of style names */
   fontKeys: Map<string, Set<string>>;
   /**
-   * 祖先元素被丢弃的旋转角累计（CSS 顺时针为正）。带子节点的元素其
-   * rotationDegrees 不会落到 frame 上（见 convertElement），但该事实
-   * 对竖排文本的净阅读方向是必需的（如 MDN BCD 表头：vertical-rl +
-   * 父级 rotate(180deg) = 自下而上）。仅用于文本方向推导。
+   * Accumulated rotation from discarded ancestors (positive is clockwise in
+   * CSS). rotationDegrees is not applied to frames that contain children (see
+   * convertElement), but this fact is required to derive the net reading
+   * direction of vertical text. For example, an MDN BCD header using
+   * vertical-rl inside a parent rotated 180 degrees reads bottom-to-top.
+   * Used only for text direction derivation.
    */
   inheritedRotationDegrees: number;
   /** Fresh captures provide extractor-measured cross-ancestor paint bands. */
@@ -246,8 +248,9 @@ function renderGeometryFromBounds(
   rotationDegrees: number | undefined,
   layoutBounds?: ParentBounds,
 ): RenderGeometry {
-  // 测量事实优先：extractor 记录了未变换的布局盒（layoutBounds）。
-  // 只有旧 capture（无该字段）才回退到 AABB 反解估算。
+  // Prefer measured facts: the extractor records the untransformed layout box
+  // in layoutBounds. Reverse-solve the AABB only for legacy captures that lack
+  // this field.
   const localBounds =
     rotationDegrees !== undefined && rotationDegrees !== 0
       ? (layoutBounds ?? unrotateAxisAlignedBounds(bounds, rotationDegrees))
@@ -576,25 +579,29 @@ function convertElement(
       geometry.width,
       geometry.height,
     ),
-    // 单轴裁剪事实（overflow-x/y 只有一轴 hidden）：Figma 只能双轴裁剪。
-    // 取裁剪（不让装饰元素横向溢出画布）—— 比放任溢出更接近浏览器渲染。
+    // Single-axis clipping fact (only one of overflow-x/y is hidden). Figma can
+    // clip only on both axes, so enable clipping rather than letting decorative
+    // elements overflow the canvas; this is closer to browser rendering.
     clipsContent: node.clipsContent || node.clipAxes !== undefined,
     children: [],
   };
   if (hasFillClipFact) {
-    // CSS 事实：background-clip:text 时全部背景层都被裁剪到文字上，
-    // 容器本身不绘制背景 —— 清空 frame fills 防止双重上色。
+    // CSS fact: with background-clip:text, every background layer is clipped to
+    // the text and the container itself paints no background. Clear frame fills
+    // to prevent duplicate paint.
     frame.fills = [];
   }
   if (strokeWeights) {
     frame.strokeWeights = strokeWeights;
   }
   applyCornerRadii(frame, node.cornerRadii);
-  // inline 跨行 fragment 事实（extractor 的 getClientRects 测量）：bounds
-  // 是跨行 AABB，直接上色会画出横贯整行的宽带（如 MDN See also 里换行的
-  // <code> 芯片）。把 paint 迁到逐行 fragment 盒，容器变纯分组。clone
-  // 为每片重建完整装饰；slice 只保留 inline-start/end 的切边，方向由
-  // extractor 测得。字段缺失时维持旧 capture 的 LTR slice 输出。
+  // Cross-line inline fragment fact measured by extractor getClientRects.
+  // bounds is an AABB spanning multiple lines; painting it directly creates a
+  // wide band across the row, such as a wrapped <code> chip in an MDN "See
+  // also" section. Move paint to per-line fragment boxes and use the container
+  // only for grouping. clone recreates full decoration on every fragment;
+  // slice keeps only inline-start/end edges according to measured direction.
+  // When the field is absent, preserve the legacy capture's LTR slice output.
   if (node.fragmentRects !== undefined && node.fragmentRects.length > 1) {
     const paintStrokes = frame.strokes;
     const paintStrokeWeight = frame.strokeWeight;
@@ -652,7 +659,7 @@ function convertElement(
       const keepsRight =
         clonesFragmentDecoration || (inlineStartIsLeft ? last : first);
       if (paintStrokes.length > 0) {
-        // slice 的切断边不描竖线；clone 每片保留完整边框。
+        // slice omits borders on cut edges; clone keeps a full border per fragment.
         const base = paintStrokeWeights ?? {
           top: paintStrokeWeight,
           right: paintStrokeWeight,
@@ -728,8 +735,9 @@ function convertElement(
   if (blendMode) {
     frame.blendMode = blendMode;
   }
-  // 动画事实：捕获时该元素的 CSS 动画/过渡正在运行 —— 其样式是动画
-  // 中间帧采样而非设计静止态。透传为告警让设计师知情。
+  // Animation fact: a CSS animation or transition was active during capture,
+  // so the style is an intermediate frame sample rather than the designed
+  // resting state. Forward a warning to make the designer aware.
   if (node.animationState === "running") {
     addWarning(context, {
       code: "animation_mid_state",
@@ -748,8 +756,9 @@ function convertElement(
       frame.autoLayout = autoLayout;
     }
   }
-  // 带子节点的元素其旋转不落到 frame（rotationDegrees 仅叶子生效），
-  // 但净旋转事实要传给后代文本用于竖排方向推导（见 ConversionContext）。
+  // Rotation is not applied to frames that contain children (rotationDegrees
+  // affects leaves only), but pass the net rotation fact to descendant text for
+  // vertical reading-direction derivation (see ConversionContext).
   const droppedRotation =
     rotationDegrees === undefined && node.rotationDegrees !== undefined ? node.rotationDegrees : 0;
   const previousInheritedRotation = context.inheritedRotationDegrees;
@@ -912,8 +921,9 @@ function sortByPaintOrder(children: CaptureNode[]): CaptureNode[] {
     let max: number | undefined;
     const children = "children" in node ? (node.children ?? []) : [];
     for (const child of children) {
-      // 栈上下文事实：创建栈上下文的元素封住其后代的 z-index，
-      // 不再向祖先冒泡（CSS 语义，直读 capture 事实而非猜测）。
+      // Stacking-context fact: an element that creates a stacking context
+      // contains descendant z-index values so they no longer bubble to
+      // ancestors. This is CSS semantics read directly from capture facts.
       const relevant = isRelevantToSiblingPaintBand(child, peers);
       let own: number | undefined;
       if (child.zIndex !== undefined && relevant) {
@@ -1208,12 +1218,14 @@ function convertText(
   ) {
     return convertMeasuredTextPixelFallback(node, parentBounds, context);
   }
-  // 行锚点漂移：多行文本的浏览器 fragment 不一定共享同一个对齐盒。
-  // 典型场景是居中段落中的 inline 链接从上一段文字的行尾开始、再续到
-  // 下一行；链接虽然继承 text-align:center，但它自己的两行并不围绕链接
-  // AABB 的中心排列。单个 Figma TEXT 只能共享一个 left/center/right 锚点，
-  // 因而会把首行拉回盒内并覆盖前文。直接比较浏览器测得的行锚点；锚点
-  // 不一致时按行拆分，各自消费 measuredLines 的绝对几何事实。
+  // Line-anchor drift: browser fragments in multiline text do not necessarily
+  // share one alignment box. A common case is an inline link in a centered
+  // paragraph that starts at the end of a preceding line and continues onto the
+  // next. Although it inherits text-align:center, its own lines are not centered
+  // around the link AABB. A single Figma TEXT node can use only one
+  // left/center/right anchor, which pulls the first line back into the box and
+  // overlaps preceding text. Compare browser-measured line anchors directly;
+  // when they differ, split by line and consume each measuredLines geometry fact.
   const lines = node.measuredLines;
   if (
     lines !== undefined &&
@@ -1293,8 +1305,9 @@ function measuredLineAnchorTolerance(style: TextStyle): number {
 }
 
 /**
- * 按 measuredLines 行矩形拆分为透明 FRAME + 每行 TEXT。
- * 行文本与 characters 对不上时返回 null 走单节点原路径（保守）。
+ * Split measuredLines rectangles into a transparent FRAME with one TEXT node
+ * per line. Return null and keep the conservative single-node path when line
+ * text does not align with characters.
  */
 function convertTextPerLine(
   node: CaptureTextNode,
@@ -1335,8 +1348,9 @@ function convertTextPerLine(
     const line = lines[i]!;
     const lineStart = offset;
     const lineEnd = offset + charLines[i]!.length;
-    offset = lineEnd + 1; // 跳过 \n
-    // 行 TEXT 相对 frame 定位：frame 的绝对原点就是原节点 bounds 原点。
+    offset = lineEnd + 1; // Skip \n.
+    // Position each line TEXT relative to the frame whose absolute origin is
+    // the original node bounds origin.
     const lineCaptureNode: CaptureTextNode = {
       ...node,
       text: charLines[i]!,
@@ -1356,7 +1370,8 @@ function convertTextPerLine(
       { x: node.bounds.x, y: node.bounds.y, width: node.bounds.width, height: node.bounds.height },
       context,
     );
-    // convertSingleText 对空 segments 不生成分段；把整体分段按行区间重映射。
+    // convertSingleText does not emit runs for empty segments. Remap full-text
+    // segments to each line range.
     const lineSegments = fullSegments
       .map((seg) => ({
         ...seg,
@@ -1367,7 +1382,8 @@ function convertTextPerLine(
     if (lineSegments.length > 1) {
       lineNode.segments = lineSegments;
     } else if (lineSegments.length === 1) {
-      // 单分段整行：把分段样式提升为行节点样式，保持节点精简。
+      // For a line with one run, promote run style to the line node to keep the
+      // structure compact.
       const only = lineSegments[0]!;
       lineNode.fontFamily = only.fontFamily;
       lineNode.fontStyle = only.fontStyle;
@@ -1398,14 +1414,18 @@ function convertSingleText(
   const lineHeightPx = resolvedLineHeightPx(node);
   registerFont(context, fontFamily, fontStyle);
 
-  // 竖排书写模式事实：Figma 没有原生竖排文本，但侧向字形（sideways）
-  // 呈现等价于「横排文本旋转」：vertical-rl/vertical-lr（非 upright）与
-  // sideways-rl 为顺时针 90°，sideways-lr 为逆时针 90°。叠加祖先被丢弃
-  // 的旋转（如 MDN BCD 表头 vertical-rl + rotate(180deg) = 自下而上即净
-  // -90°）得到净角。plan 旋转约定与 extractor/preview 一致：CSS 顺时针
-  // 为正、绕节点中心。节点盒取「未旋转的横排盒」：与捕获 AABB 同中心、
-  // 宽高互换。text-orientation: upright（CJK 直立列）字形不旋转、无法
-  // 用该模型表达 —— 显式告警降级而不是错误旋转。
+  // Vertical-writing fact: Figma has no native vertical text, but sideways
+  // glyphs are equivalent to rotated horizontal text. vertical-rl/vertical-lr
+  // (except upright) and sideways-rl rotate 90 degrees clockwise;
+  // sideways-lr rotates 90 degrees counterclockwise. Combine this with dropped
+  // ancestor rotation to obtain the net angle. For example, an MDN BCD header
+  // using vertical-rl inside rotate(180deg) becomes -90 degrees and reads
+  // bottom-to-top. Plan rotation follows extractor/preview conventions:
+  // positive is CSS clockwise around the node center. Use an unrotated
+  // horizontal node box centered on the captured AABB with width and height
+  // swapped. text-orientation: upright leaves glyphs unrotated and cannot be
+  // represented by this model, so emit an explicit fallback warning rather
+  // than applying an incorrect rotation.
   let verticalRotationDegrees: number | undefined;
   if (node.writingMode !== undefined && node.textOrientation === "upright") {
     addWarning(context, {
@@ -1426,8 +1446,9 @@ function convertSingleText(
 
   const segments = buildSegments(node, context);
 
-  // 文本填充：background-clip:text 是测量事实 —— 文字用容器 fills 上色
-  // （渐变/图片），而不是 style.color（通常是 transparent，兜黑的根源）。
+  // Text fill: background-clip:text is a measured fact. Color text with the
+  // container fills (gradient or image) rather than style.color, which is often
+  // transparent and otherwise falls back to black.
   let textFills: FigmaPaint[] = [solidPaint(style.color)];
   if (node.fillClip !== undefined && node.fillClip.fills.length > 0) {
     const clipFills = node.fillClip.fills
@@ -1478,21 +1499,23 @@ function convertSingleText(
     text.segments = segments;
   }
   if (verticalRotationDegrees !== undefined) {
-    // 未旋转横排盒：与捕获 AABB 同中心，宽高互换（±90°）。
+    // Unrotated horizontal box centered on the captured AABB with width and
+    // height swapped for a 90-degree rotation.
     const { bounds } = node;
     text.width = Math.max(1, round2(bounds.height));
     text.height = Math.max(1, round2(bounds.width));
     text.x = round2(bounds.x + (bounds.width - bounds.height) / 2 - parentBounds.x);
     text.y = round2(bounds.y + (bounds.height - bounds.width) / 2 - parentBounds.y);
     text.rotationDegrees = verticalRotationDegrees;
-    // 旋转前仍保留捕获到的行向宽度。没有浏览器行盒事实时固定该宽度，
-    // 避免目标字体把整段竖排内容扩成一条无界长线。
+    // Preserve captured inline width before rotation. When browser line-box
+    // facts are absent, fix this width so the target font cannot expand an
+    // entire vertical passage into an unbounded line.
     text.textAutoResize = node.measuredLines !== undefined ? "WIDTH_AND_HEIGHT" : "HEIGHT";
   }
   return text;
 }
 
-/** 归一化角度到 (-180, 180]，便于下游用最小旋转表达。 */
+/** Normalize an angle to (-180, 180] for the smallest downstream rotation. */
 function normalizeDegrees(degrees: number): number {
   let d = degrees % 360;
   if (d > 180) d -= 360;
@@ -1501,17 +1524,21 @@ function normalizeDegrees(degrees: number): number {
 }
 
 function textAutoResizeMode(node: CaptureTextNode): RenderPlanTextNode["textAutoResize"] {
-  // 测量事实：extractor 已枚举浏览器真实行盒，断行以 \n 烘焙进 text。
-  // 单行与多行都用 hug（WIDTH_AND_HEIGHT）：行数严格等于测量行数。
-  // 若用固定宽度 HEIGHT，回退字体偏宽时会在烘焙断行之上二次换行
-  // （行数膨胀、压叠下方内容）；hug 下回退字体只会让行向右伸长，
-  // 破坏面小得多，且断行事实保持权威。
+  // Measured fact: the extractor enumerated real browser line boxes and baked
+  // breaks into text with \n. Use hug sizing (WIDTH_AND_HEIGHT) for both single
+  // and multiline text so line count exactly matches the measurement. With
+  // fixed-width HEIGHT, a wider fallback font wraps again on top of baked line
+  // breaks, inflating line count and overlapping content below. With hug sizing,
+  // the fallback font can only extend a line horizontally, which is less
+  // destructive and keeps measured line breaks authoritative.
   if (node.measuredLines !== undefined) {
     return "WIDTH_AND_HEIGHT";
   }
-  // 没有 measuredLines 时，唯一可靠的几何事实是捕获宽度。HEIGHT 保持
-  // 该宽度并让目标运行时按实际字体增高；WIDTH_AND_HEIGHT 会解除宽度约束，
-  // 把未知换行的正文拉成一条不可读长线。显式 pre/BR 换行也走同一路径。
+  // Without measuredLines, captured width is the only reliable geometry fact.
+  // HEIGHT preserves that width and lets the target runtime grow with its
+  // actual font. WIDTH_AND_HEIGHT removes the width constraint and stretches
+  // text with unknown wrapping into an unreadable line. Explicit pre/BR breaks
+  // use the same path.
   return "HEIGHT";
 }
 
@@ -1525,10 +1552,11 @@ function resolvedLineHeightPx(node: CaptureTextNode): number {
   return styleLineHeight;
 }
 
-// 注意：这里刻意没有 y 偏移补偿。文本节点的 y/height 是捕获的字体盒事实，
-// 渲染端（preview 的 correction、Figma 的文本盒布局）都以 height 为准垂直
-// 放置基线；conversion 再加偏移会双重补偿，把文字压得比相邻图标低
-// （MDN 导航菜单文字比 chevron 低 2px 的根源）。
+// There is intentionally no y-offset correction here. A text node's y/height
+// are captured font-box facts. Both preview correction and Figma text-box
+// layout position the baseline from height. Adding another conversion offset
+// would double-correct it and push text below neighboring icons, which caused
+// MDN navigation text to sit 2px below its chevron.
 function normalLineHeightNeedsAdjustment(
   node: CaptureTextNode,
   fontSize: number,
@@ -1987,8 +2015,8 @@ function convertPaint(
         scaleMode: mapScaleMode(paint.scaleMode),
         opacity: 1,
       };
-      // 平铺瓦片尺寸事实：显式 px 的 background-size 决定每块瓦片大小。
-      // Figma TILE 用 scalingFactor（瓦片尺寸 / 图片原始尺寸）表达。
+      // Tile-size fact: an explicit pixel background-size determines each tile.
+      // Figma TILE expresses it as scalingFactor (tile size / intrinsic image size).
       if (imagePaint.scaleMode === "TILE" && paint.tileSizePx !== undefined) {
         const naturalWidth = paint.naturalWidth ?? asset.naturalWidth;
         const naturalHeight = paint.naturalHeight ?? asset.naturalHeight;
@@ -2005,8 +2033,9 @@ function convertPaint(
           imagePaint.scalingFactor = round2(factor);
         }
       }
-      // 单轴平铺事实（repeat-x / repeat-y）：Figma TILE 只能双轴平铺，
-      // 无法精确表达 —— 显式告警而不是静默近似。
+      // Single-axis repeat fact (repeat-x/repeat-y). Figma TILE repeats on both
+      // axes and cannot express this exactly, so warn instead of silently
+      // approximating.
       if (paint.repeat === "repeat-x" || paint.repeat === "repeat-y") {
         addWarning(context, {
           code: "unsupported_paint",
@@ -2598,9 +2627,10 @@ function buildAssets(context: ConversionContext): RenderPlanAsset[] {
         });
         continue;
       }
-      // <svg> 元素的 markup 附在节点上（svgMarkup），无需字节载荷；
-      // 但 IMAGE fill 引用的 SVG 资产（背景图 SVG、mask 染色图标）没有
-      // svgMarkup 通道 —— 丢掉资产就渲染成空白。此类资产必须保留。
+      // An <svg> element carries markup on the node through svgMarkup and needs
+      // no byte payload. SVG assets referenced by IMAGE fills (background SVGs
+      // and tinted mask icons) have no svgMarkup channel; dropping them renders
+      // blank output, so these assets must be retained.
       if (!context.fillAssetIds.has(assetId)) {
         continue;
       }

@@ -301,7 +301,7 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
           #toggle::before { content: "["; }
           #toggle::after { content: "]"; }
         </style>
-        <span id="toggle">表示</span>
+        <span id="toggle">Display</span>
       `);
       const expectedBracketWidth = await page.$eval("#toggle", (element) => {
         const style = getComputedStyle(element, "::before");
@@ -321,7 +321,7 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
       const after = toggle.children.find(
         (node) => node.type === "element" && node.pseudo === "after",
       );
-      const label = toggle.children.find((node) => node.type === "text" && node.text === "表示");
+      const label = toggle.children.find((node) => node.type === "text" && node.text === "Display");
       if (before?.type !== "element" || after?.type !== "element" || label?.type !== "text") {
         throw new Error("expected text and pseudo nodes");
       }
@@ -1013,7 +1013,7 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
           }
         </style>
         <div id="eyebrow">
-          <span>Stripe 承载的全球 GDP 份额：</span>
+          <span>Share of global GDP carried by Stripe:</span>
           <span class="counter">
             <span class="counter-value">1.677%</span>
             <span class="counter-duplicate">1.677%</span>
@@ -1030,7 +1030,9 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
       expect(
         texts.some((text) => text.includes("GDP") && text.includes("1.677")),
       ).toBe(false);
-      expect(texts.map((text) => text.trim())).toContain("Stripe 承载的全球 GDP 份额：");
+      expect(texts.map((text) => text.trim())).toContain(
+        "Share of global GDP carried by Stripe:",
+      );
       expect(texts.filter((text) => text === "1.677%").length).toBeGreaterThanOrEqual(1);
       expect(texts.every((text) => !text.includes("\n"))).toBe(true);
     } finally {
