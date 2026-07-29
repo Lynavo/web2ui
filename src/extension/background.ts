@@ -4,8 +4,11 @@ import { BackgroundController, type BackgroundPlatform } from "./background-cont
 import { MAX_ASSET_BYTES } from "./content-assets.js";
 import { RenderPlanStore } from "./plan-store.js";
 import { isPopupMessage, type ContentMessage, type PopupResponse } from "./types.js";
+import type { ExtensionState } from "./state-machine.js";
 
 const RESULT_EXPIRY_ALARM = "web2ui-local-result-expiry";
+const EXTENSION_STATES_KEY = "extensionStates";
+const LEGACY_EXTENSION_STATE_KEY = "extensionState";
 const store = new RenderPlanStore();
 const platform: BackgroundPlatform = {
   now: Date.now,
@@ -57,13 +60,26 @@ const platform: BackgroundPlatform = {
   sendCaptureCommand: async (tabId, documentId, command) => {
     await chrome.tabs.sendMessage(tabId, command, { documentId });
   },
-  saveState: async (state) => {
-    await chrome.storage.local.set({ extensionState: state });
-    if (state.status === "ready") {
-      await chrome.alarms.create(RESULT_EXPIRY_ALARM, { when: state.expiresAt });
-    } else {
-      await chrome.alarms.clear(RESULT_EXPIRY_ALARM);
-    }
+  loadStates: async () => {
+    const stored = await chrome.storage.local.get([
+      EXTENSION_STATES_KEY,
+      LEGACY_EXTENSION_STATE_KEY,
+    ]);
+    if (stored[EXTENSION_STATES_KEY] !== undefined) return stored[EXTENSION_STATES_KEY];
+    const legacy = stored[LEGACY_EXTENSION_STATE_KEY] as ExtensionState | undefined;
+    return typeof legacy === "object" && legacy !== null && "tabId" in legacy
+      ? { [String(legacy.tabId)]: legacy }
+      : {};
+  },
+  saveStates: async (states) => {
+    await chrome.storage.local.set({ [EXTENSION_STATES_KEY]: states });
+    await chrome.storage.local.remove(LEGACY_EXTENSION_STATE_KEY);
+  },
+  scheduleResultExpiry: async (when) => {
+    await chrome.alarms.create(RESULT_EXPIRY_ALARM, { when });
+  },
+  clearResultExpiry: async () => {
+    await chrome.alarms.clear(RESULT_EXPIRY_ALARM);
   },
 };
 
@@ -79,13 +95,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (isContentMessage(message)) {
     if (sender.tab?.id === undefined || sender.documentId === undefined) return undefined;
     const senderIdentity = { tabId: sender.tab.id, documentId: sender.documentId };
-    if (!controller.acceptsContentIdentity(message, senderIdentity)) {
-      sendResponse({ ok: false, code: "stale-capture" });
-      return undefined;
-    }
-
     void initialization
       .then(async () => {
+        if (!controller.acceptsContentIdentity(message, senderIdentity)) {
+          return { ok: false, code: "stale-capture" };
+        }
         if (message.type === "fetch-asset") return fetchDeclaredAsset(message.url);
         if (message.type === "capture-element-screenshot") {
           return captureElementScreenshot(message.tabId, message.rect);
@@ -102,8 +116,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   void initialization
     .then(async (): Promise<PopupResponse> => {
       switch (message.type) {
-        case "get-state":
-          return { ok: true, state: controller.getState() };
+        case "get-state": {
+          const tab = await platform.getActiveTab();
+          return { ok: true, state: controller.getState(tab.id) };
+        }
         case "get-active-tab-viewport": {
           try {
             const tab = await platform.getActiveTab();
@@ -131,18 +147,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return { ok: true, state };
         }
         case "prepare-clipboard":
-          return { ok: true, payload: await controller.prepareClipboard() };
-        case "clear-result":
-          await controller.clear();
+          return { ok: true, payload: await controller.prepareClipboard(message.tabId) };
+        case "clear-result": {
+          await controller.clear(message.tabId);
           return { ok: true };
+        }
       }
     })
     .then(sendResponse)
-    .catch(() => {
-      const state = controller.getState();
+    .catch(async (error: unknown) => {
+      const tab = await platform.getActiveTab().catch(() => null);
+      const state = controller.getState(tab?.id);
+      const code =
+        error instanceof Error && error.message === "Unsupported page"
+          ? "unsupported-page"
+          : state.status === "error"
+            ? state.code
+            : "local-operation-failed";
       sendResponse({
         ok: false,
-        code: state.status === "error" ? state.code : "local-operation-failed",
+        code,
       });
     });
   return true;
@@ -150,33 +174,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" || changeInfo.url !== undefined) {
-    void controller.failIfCaptureDocumentChanged(tabId);
+    void initialization.then(() => controller.handlePageChange(tabId));
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  void controller.failForPageChange(tabId, true);
+  void initialization.then(() => controller.removeTab(tabId));
 });
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId !== undefined && controller.getActiveTabId() === source.tabId) {
+  if (source.tabId !== undefined && controller.hasActiveSession(source.tabId)) {
     void controller.failForPageChange(source.tabId, false);
   }
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== RESULT_EXPIRY_ALARM) return;
-  void initialization
-    .then(async () => {
-      const state = controller.getState();
-      if (state.status !== "ready") return;
-      if (state.expiresAt <= Date.now()) {
-        await controller.clear();
-        return;
-      }
-      await chrome.alarms.create(RESULT_EXPIRY_ALARM, { when: state.expiresAt });
-    })
-    .catch(() => undefined);
+  void initialization.then(() => controller.handleResultExpiry()).catch(() => undefined);
 });
 
 async function fetchDeclaredAsset(url: string): Promise<{

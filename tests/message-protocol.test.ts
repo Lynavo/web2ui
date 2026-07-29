@@ -41,6 +41,10 @@ describe("standalone extension message protocol", () => {
         },
       }),
     ).toBe(true);
+    expect(isPopupMessage({ type: "prepare-clipboard", tabId: 42 })).toBe(true);
+    expect(isPopupMessage({ type: "clear-result", tabId: 42 })).toBe(true);
+    expect(isPopupMessage({ type: "prepare-clipboard" })).toBe(false);
+    expect(isPopupMessage({ type: "clear-result", tabId: -1 })).toBe(false);
     expect(isPopupMessage({ type: "start-capture", mode: "selection" })).toBe(false);
     expect(isPopupMessage({ type: "send-to-figma" })).toBe(false);
     expect(isPopupMessage({ type: "retry" })).toBe(false);

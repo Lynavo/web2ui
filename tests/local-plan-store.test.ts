@@ -52,7 +52,7 @@ function buildPlan(id: string): RenderPlan {
 }
 
 describe("RenderPlanStore", () => {
-  it("stores exactly the latest portable RenderPlan", async () => {
+  it("stores portable RenderPlans independently for each tab", async () => {
     const indexedDB = new IDBFactory();
     const store = new RenderPlanStore({ indexedDB, dbName: "replace-plan" });
 
@@ -69,15 +69,12 @@ describe("RenderPlanStore", () => {
       mode: "full-page",
     });
 
-    const current = await store.getCurrent();
-    expect(current?.plan.renderPlanId).toBe("rp_second");
-    expect(current?.runId).toBe("run_second");
-    expect(current?.tabId).toBe(8);
-    expect(current?.documentId).toBe("document_second");
-    expect(current?.mode).toBe("full-page");
+    expect((await store.get(7))?.plan.renderPlanId).toBe("rp_first");
+    expect((await store.get(8))?.plan.renderPlanId).toBe("rp_second");
+    expect(await store.getAll()).toHaveLength(2);
   });
 
-  it("removes the current plan after the fixed 24 hour TTL", async () => {
+  it("removes each tab plan after the fixed 24 hour TTL", async () => {
     const indexedDB = new IDBFactory();
     let now = Date.UTC(2026, 6, 13, 0, 0, 0);
     const store = new RenderPlanStore({ indexedDB, dbName: "expired-plan", now: () => now });
@@ -88,11 +85,11 @@ describe("RenderPlanStore", () => {
       documentId: "document_expiring",
       mode: "visible-area",
     });
-    expect((await store.getCurrent())?.expiresAt).toBe(now + RENDER_PLAN_TTL_MS);
+    expect((await store.get(4))?.expiresAt).toBe(now + RENDER_PLAN_TTL_MS);
 
     now += RENDER_PLAN_TTL_MS + 1;
-    expect(await store.getCurrent()).toBeNull();
-    expect(await store.getCurrent()).toBeNull();
+    expect(await store.get(4)).toBeNull();
+    expect(await store.get(4)).toBeNull();
   });
 
   it("rejects a plan beyond the 25 MiB production limit before writing", async () => {
@@ -113,7 +110,7 @@ describe("RenderPlanStore", () => {
     expect(await store.getCurrent()).toBeNull();
   });
 
-  it("clears the current plan explicitly", async () => {
+  it("clears one tab plan explicitly", async () => {
     const store = new RenderPlanStore({ indexedDB: new IDBFactory(), dbName: "clear-plan" });
     await store.put(buildPlan("clear"), {
       runId: "run_clear",
@@ -122,8 +119,8 @@ describe("RenderPlanStore", () => {
       mode: "visible-area",
     });
 
-    await store.clear();
+    await store.clear(1);
 
-    expect(await store.getCurrent()).toBeNull();
+    expect(await store.get(1)).toBeNull();
   });
 });

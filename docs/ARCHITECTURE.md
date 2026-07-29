@@ -32,8 +32,8 @@ Background service worker ── injects ──► Content runtime in the active
 ```
 
 The popup never reads the page directly. The content runtime never owns durable state. The
-background service worker coordinates the run, validates identities, owns privileged Chrome
-operations, performs conversion, and stores the current result.
+background service worker coordinates per-tab runs, validates identities, owns privileged Chrome
+operations, performs conversion, and stores one bounded result for each source tab.
 
 ## Modules and interfaces
 
@@ -89,7 +89,7 @@ implementation. Tests call the same exported conversion interfaces used by the e
 | `background-controller.ts` | Coordinates capture state, privileged cleanup, validation, conversion, persistence, and clipboard preparation. |
 | `content.ts` | Runs the capture implementation in the active document and reports progress/results. |
 | `content-*.ts` | Separates orchestration, asset recovery, fallback capture, and scrolling behavior. |
-| `plan-store.ts` | Validates and stores one bounded RenderPlan in IndexedDB. |
+| `plan-store.ts` | Validates and stores one bounded RenderPlan per source tab in IndexedDB. |
 | `state-machine.ts` | Defines valid user-visible state transitions. |
 | `types.ts` | Defines and validates popup/content message interfaces. |
 | `popup/` | Presents controls and performs the final user-gesture clipboard write. |
@@ -108,8 +108,9 @@ by type and keys; unknown modes and malformed capture options are rejected.
 
 Every capture has a random run ID plus the Chrome tab ID and document ID. The controller accepts a
 message only when all three values match the active session and Chrome's sender metadata. A
-navigation, tab closure, debugger detach, stale document, or superseding run invalidates the
-session.
+navigation or closure of the source tab, debugger detach, stale document, or superseding run in
+that same tab invalidates the session. Sessions and user-visible progress are isolated by tab, so
+changing the active tab does not cancel a capture already running in another tab.
 
 ### Page assets
 
@@ -122,9 +123,16 @@ receive a neutral placeholder, missing paints are omitted, and the node-scoped w
 
 ### Local persistence
 
-IndexedDB holds one record named `current`. `RenderPlanStore` validates its contract, rejects
-plans larger than 25 MiB, and assigns a 24-hour expiry. The service worker also schedules a Chrome
-alarm, clears expired data at startup, and clears previous data before a new capture.
+IndexedDB holds one record per source tab. `RenderPlanStore` validates each contract, rejects plans
+larger than 25 MiB, and assigns a 24-hour expiry. The service worker schedules a Chrome alarm for
+the next deadline, clears expired data at startup, and clears previous data for that tab before a
+new valid capture.
+
+Chrome extension storage holds only small per-tab interface states such as progress, ready, and
+error. Opening the popup reads the active tab's state: unrelated tabs therefore show the capture
+home instead of another tab's progress or error. Returning to a source tab restores its state.
+Several capture sessions and completed results may run independently. A failed or unsupported
+capture in another tab does not overwrite a source tab's state or result.
 
 ### Clipboard
 
@@ -155,7 +163,8 @@ adds public license/install/source metadata and produces a checksum and SPDX SBO
   semantics.
 - Canvas, video, WebGL, unsupported SVG, and browser-only effects use the bounded
   `local-static-v1` single-frame fallback profile.
-- The extension captures one viewport/theme combination and stores one current result.
+- Each capture uses one viewport/theme combination. Captures may run in multiple tabs, with one
+  current completed result retained per source tab.
 - There is no capture-data migration path to or runtime dependency on a hosted product. The popup
   may open the separately hosted commercial website after an explicit user click, but does not
   call its APIs or transfer capture state.

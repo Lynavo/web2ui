@@ -21,6 +21,8 @@ function chromeHarness() {
   const debuggerDetachListeners: Array<(...arguments_: unknown[]) => void> = [];
   const alarmListeners: Array<(alarm: chrome.alarms.Alarm) => void> = [];
   const addRuntimeListener = vi.fn((listener: RuntimeListener) => runtimeListeners.push(listener));
+  const localStorage: Record<string, unknown> = {};
+  let activeTab = { id: 7, url: "https://fixture.invalid/page" };
 
   const chromeMock = {
     runtime: {
@@ -28,7 +30,7 @@ function chromeHarness() {
       onMessage: { addListener: addRuntimeListener },
     },
     tabs: {
-      query: vi.fn(async () => [{ id: 7, url: "https://fixture.invalid/page" }]),
+      query: vi.fn(async () => [{ ...activeTab }]),
       sendMessage: vi.fn(
         async (tabId: number, message: unknown, options?: { documentId?: string }) => {
           void tabId;
@@ -64,7 +66,23 @@ function chromeHarness() {
       onAlarm: { addListener: vi.fn((listener) => alarmListeners.push(listener)) },
     },
     storage: {
-      local: { set: vi.fn(async () => undefined) },
+      local: {
+        get: vi.fn(async (keys: string | string[] | null) => {
+          if (keys === null) return structuredClone(localStorage);
+          const requested = Array.isArray(keys) ? keys : [keys];
+          return Object.fromEntries(
+            requested
+              .filter((key) => key in localStorage)
+              .map((key) => [key, structuredClone(localStorage[key])]),
+          );
+        }),
+        set: vi.fn(async (values: Record<string, unknown>) => {
+          Object.assign(localStorage, structuredClone(values));
+        }),
+        remove: vi.fn(async (keys: string | string[]) => {
+          for (const key of Array.isArray(keys) ? keys : [keys]) delete localStorage[key];
+        }),
+      },
     },
   };
 
@@ -76,6 +94,10 @@ function chromeHarness() {
     tabRemovedListeners,
     debuggerDetachListeners,
     alarmListeners,
+    localStorage,
+    setActiveTab: (id: number, url = `https://fixture.invalid/tab-${id}`) => {
+      activeTab = { id, url };
+    },
   };
 }
 
@@ -207,6 +229,7 @@ describe("background runtime", () => {
   it("runs capture and conversion locally without making a developer-service request", async () => {
     const harness = chromeHarness();
     const fetchSpy = vi.fn();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     vi.stubGlobal("chrome", harness.chromeMock);
     vi.stubGlobal("indexedDB", new IDBFactory());
     vi.stubGlobal("fetch", fetchSpy);
@@ -271,7 +294,7 @@ describe("background runtime", () => {
       { when: expiresAt },
     );
 
-    vi.spyOn(Date, "now").mockReturnValue(expiresAt!);
+    nowSpy.mockReturnValue(expiresAt!);
     harness.alarmListeners[0]?.({ name: "web2ui-local-result-expiry", scheduledTime: expiresAt! });
     const expiredStateResponse = vi.fn();
     await vi.waitFor(() => {
@@ -351,5 +374,95 @@ describe("background runtime", () => {
         },
       });
     });
+  });
+
+  it("shows the active tab's own state while other capture runs continue", async () => {
+    const harness = chromeHarness();
+    vi.stubGlobal("chrome", harness.chromeMock);
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    await import("../src/extension/background.js");
+
+    const listener = harness.runtimeListeners[0];
+    if (!listener) throw new Error("runtime listener missing");
+    const startA = vi.fn();
+    listener({ type: "start-capture", mode: "visible-area" }, { id: "extension-id" }, startA);
+    await vi.waitFor(() => expect(startA).toHaveBeenCalledWith({
+      ok: true,
+      state: expect.objectContaining({ status: "capturing", tabId: 7 }),
+    }));
+    const commandA = harness.chromeMock.tabs.sendMessage.mock.calls[0]?.[1] as Record<string, unknown>;
+
+    harness.setActiveTab(8);
+    const idleB = vi.fn();
+    listener({ type: "get-state" }, { id: "extension-id" }, idleB);
+    await vi.waitFor(() => expect(idleB).toHaveBeenCalledWith({
+      ok: true,
+      state: { status: "idle" },
+    }));
+
+    const startB = vi.fn();
+    listener({ type: "start-capture", mode: "full-page" }, { id: "extension-id" }, startB);
+    await vi.waitFor(() => expect(startB).toHaveBeenCalledWith({
+      ok: true,
+      state: expect.objectContaining({ status: "capturing", tabId: 8 }),
+    }));
+
+    const progressA = vi.fn();
+    listener(
+      { ...commandA, type: "capture-progress", progress: 0.42, label: "Reading tab A" },
+      { id: "extension-id", tab: { id: 7 } as chrome.tabs.Tab, documentId: "document_current" },
+      progressA,
+    );
+    await vi.waitFor(() => expect(progressA).toHaveBeenCalledWith({ ok: true }));
+
+    harness.setActiveTab(7);
+    const stateA = vi.fn();
+    listener({ type: "get-state" }, { id: "extension-id" }, stateA);
+    await vi.waitFor(() => expect(stateA).toHaveBeenCalledWith({
+      ok: true,
+      state: expect.objectContaining({
+        status: "capturing",
+        tabId: 7,
+        progress: 0.42,
+        label: "Reading tab A",
+      }),
+    }));
+  });
+
+  it("keeps a successful source result when capture is attempted on a protected tab", async () => {
+    const harness = chromeHarness();
+    vi.stubGlobal("chrome", harness.chromeMock);
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    await import("../src/extension/background.js");
+
+    const listener = harness.runtimeListeners[0];
+    if (!listener) throw new Error("runtime listener missing");
+    const start = vi.fn();
+    listener({ type: "start-capture", mode: "visible-area" }, { id: "extension-id" }, start);
+    await vi.waitFor(() => expect(start).toHaveBeenCalled());
+    const command = harness.chromeMock.tabs.sendMessage.mock.calls[0]?.[1] as Record<string, unknown>;
+    const done = vi.fn();
+    listener(
+      { ...command, type: "capture-done", document: captureDocument() },
+      { id: "extension-id", tab: { id: 7 } as chrome.tabs.Tab, documentId: "document_current" },
+      done,
+    );
+    await vi.waitFor(() => expect(done).toHaveBeenCalledWith({ ok: true }));
+
+    harness.setActiveTab(10, "chrome://settings");
+    const blocked = vi.fn();
+    listener({ type: "start-capture", mode: "visible-area" }, { id: "extension-id" }, blocked);
+    await vi.waitFor(() => expect(blocked).toHaveBeenCalledWith({
+      ok: false,
+      code: "unsupported-page",
+    }));
+
+    harness.setActiveTab(7);
+    const sourceState = vi.fn();
+    listener({ type: "get-state" }, { id: "extension-id" }, sourceState);
+    await vi.waitFor(() => expect(sourceState).toHaveBeenCalledWith({
+      ok: true,
+      state: expect.objectContaining({ status: "ready", tabId: 7 }),
+    }));
   });
 });

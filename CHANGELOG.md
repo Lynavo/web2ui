@@ -4,6 +4,15 @@ All user-visible changes to Web2UI — Copy for Figma are recorded here.
 
 ## Unreleased
 
+- Isolated capture progress and errors by Chrome tab so switching tabs shows the correct local
+  state and returning to a source tab restores its in-progress or ready view.
+- Allowed independent capture sessions and completed local results in multiple tabs, with each
+  source tab retaining its own RenderPlan.
+- Prevented unsupported-page errors, unrelated tab navigation, and unrelated tab closure from
+  deleting another tab's completed local result.
+- Preserved the official 0.1.2 open-source popup UI while adding the multi-tab state isolation
+  fixes, including the original **Copy for Figma** Capture Ready view and local-result controls.
+
 ## 0.1.2 — 2026-07-24
 
 - Moved the public source, issue, security, and release links to `Lynavo/web2ui` after the

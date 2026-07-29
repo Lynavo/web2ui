@@ -11,6 +11,7 @@ import {
 } from "./plan-store.js";
 import {
   initialExtensionState,
+  isExtensionState,
   reduceExtensionState,
   type CaptureMode,
   type CaptureRunIdentity,
@@ -42,8 +43,9 @@ export interface LocalPlanStore {
     plan: RenderPlan,
     identity: CaptureRunIdentity & { mode: CaptureMode },
   ): Promise<StoredRenderPlan>;
-  getCurrent(): Promise<StoredRenderPlan | null>;
-  clear(): Promise<void>;
+  get(tabId: number): Promise<StoredRenderPlan | null>;
+  getAll(): Promise<StoredRenderPlan[]>;
+  clear(tabId: number): Promise<void>;
   cleanupExpired(): Promise<void>;
 }
 
@@ -72,7 +74,10 @@ export interface BackgroundPlatform {
     documentId: string,
     command: RunCaptureCommand,
   ): Promise<void>;
-  saveState(state: ExtensionState): Promise<void>;
+  loadStates(): Promise<unknown>;
+  saveStates(states: Record<string, ExtensionState>): Promise<void>;
+  scheduleResultExpiry(when: number): Promise<void>;
+  clearResultExpiry(): Promise<void>;
 }
 
 interface DebuggerSession {
@@ -92,8 +97,10 @@ export class BackgroundController {
   readonly #clipboard: (
     plan: RenderPlan,
   ) => FigmaClipboardPayload | Promise<FigmaClipboardPayload>;
-  #state: ExtensionState = initialExtensionState();
-  #session: DebuggerSession | null = null;
+  readonly #states = new Map<number, ExtensionState>();
+  readonly #sessions = new Map<number, DebuggerSession>();
+  #stateWrite: Promise<void> = Promise.resolve();
+  #resultLock: Promise<void> = Promise.resolve();
 
   constructor(options: {
     platform: BackgroundPlatform;
@@ -107,43 +114,64 @@ export class BackgroundController {
     this.#clipboard = options.clipboard;
   }
 
-  getState(): ExtensionState {
-    return this.#state;
+  getState(tabId?: number): ExtensionState {
+    const resolvedTabId = this.#resolveTabId(tabId);
+    return resolvedTabId === null
+      ? initialExtensionState()
+      : this.#states.get(resolvedTabId) ?? initialExtensionState();
   }
 
   async initialize(): Promise<void> {
     await this.#store.cleanupExpired();
-    const stored = await this.#store.getCurrent();
-    if (!stored) {
-      await this.#setState(initialExtensionState());
-      return;
+    await this.#restorePersistedStates();
+    const storedPlans = await this.#store.getAll();
+    const plansByTab = new Map(storedPlans.map((stored) => [stored.tabId, stored]));
+    for (const [tabId, state] of this.#states) {
+      if (
+        (state.status === "ready" || state.status === "preparing-clipboard") &&
+        plansByTab.get(tabId)?.runId !== state.runId
+      ) {
+        this.#states.delete(tabId);
+      }
     }
-    await this.#setState({
-      status: "ready",
-      runId: stored.runId,
-      tabId: stored.tabId,
-      documentId: stored.documentId,
-      mode: stored.mode,
-      createdAt: stored.createdAt,
-      expiresAt: stored.expiresAt,
-      warningCount: countVisualWarningDetails(stored.plan.warnings),
-    });
+    for (const stored of storedPlans) {
+      const restored = this.#states.get(stored.tabId);
+      this.#states.set(stored.tabId, {
+        status: "ready",
+        runId: stored.runId,
+        tabId: stored.tabId,
+        documentId: stored.documentId,
+        mode: stored.mode,
+        createdAt: stored.createdAt,
+        expiresAt: stored.expiresAt,
+        warningCount: countVisualWarningDetails(stored.plan.warnings),
+        ...(restored?.status === "ready" && restored.runId === stored.runId
+          ? {
+              copyResult: restored.copyResult,
+              copyError: restored.copyError,
+            }
+          : {}),
+      });
+    }
+    await this.#scheduleNextResultExpiry(storedPlans);
+    await this.#persistStates();
   }
 
   async startCapture(mode: CaptureMode, options: CaptureOptions): Promise<ExtensionState> {
-    await this.#cleanupDebugger();
-    await this.#store.clear();
-    await this.#setState(initialExtensionState());
-
     const tab = await this.#platform.getActiveTab();
     if (!isHttpUrl(tab.url)) {
-      await this.#setState({
+      await this.#cleanupDebugger(tab.id);
+      await this.#setState(tab.id, {
         status: "error",
         code: "unsupported-page",
         message: "Open an HTTP(S) page before capturing.",
       });
       throw new Error("Unsupported page");
     }
+
+    await this.#cleanupDebugger(tab.id);
+    await this.#clearStoredResultForNewCapture(tab.id);
+    await this.#setState(tab.id, initialExtensionState());
 
     const runId = this.#platform.nextRunId();
     const session: DebuggerSession = {
@@ -154,7 +182,7 @@ export class BackgroundController {
       metricsApplied: false,
       mediaApplied: false,
     };
-    this.#session = session;
+    this.#sessions.set(tab.id, session);
 
     try {
       const viewport = await this.#platform.measureViewport(tab.id);
@@ -188,7 +216,8 @@ export class BackgroundController {
       };
       session.identity = identity;
       await this.#setState(
-        reduceExtensionState(this.#state, {
+        tab.id,
+        reduceExtensionState(this.getState(tab.id), {
           type: "start-capture",
           identity,
           mode,
@@ -201,10 +230,15 @@ export class BackgroundController {
         mode,
         options,
       });
-      return this.#state;
+      return this.getState(tab.id);
     } catch (error) {
-      if (this.#session === session) {
-        await this.#failSession("permission-denied", "Chrome could not start this capture.");
+      if (this.#sessions.get(tab.id) === session) {
+        await this.#failSession(
+          tab.id,
+          "permission-denied",
+          "Chrome could not start this capture.",
+          session.runId,
+        );
       }
       throw error;
     }
@@ -220,7 +254,8 @@ export class BackgroundController {
     switch (message.type) {
       case "capture-progress":
         await this.#setState(
-          reduceExtensionState(this.#state, {
+          identity.tabId,
+          reduceExtensionState(this.getState(identity.tabId), {
             type: "capture-progress",
             identity,
             progress: message.progress,
@@ -229,7 +264,12 @@ export class BackgroundController {
         );
         return;
       case "capture-error":
-        await this.#failSession("capture-failed", "The page could not be captured.");
+        await this.#failSession(
+          identity.tabId,
+          "capture-failed",
+          "The page could not be captured.",
+          identity.runId,
+        );
         return;
       case "capture-done":
         await this.#completeCapture(message.document, identity);
@@ -244,7 +284,7 @@ export class BackgroundController {
     message: Pick<ContentMessage, "runId" | "tabId" | "documentId">,
     sender: { tabId: number; documentId: string },
   ): boolean {
-    const identity = this.#session?.identity;
+    const identity = this.#sessions.get(message.tabId)?.identity;
     return (
       identity !== undefined &&
       message.runId === identity.runId &&
@@ -255,55 +295,125 @@ export class BackgroundController {
     );
   }
 
-  async prepareClipboard(): Promise<FigmaClipboardPayload> {
-    if (this.#state.status !== "ready") throw new Error("No local capture is ready");
-    const identity = identityFrom(this.#state);
-    const stored = await this.#store.getCurrent();
-    if (!stored || stored.runId !== identity.runId) throw new Error("Local capture expired");
+  async prepareClipboard(tabId?: number): Promise<FigmaClipboardPayload> {
+    const resolvedTabId = this.#resolveTabId(tabId);
+    if (resolvedTabId === null) throw new Error("No local capture is ready");
+    const state = this.getState(resolvedTabId);
+    if (state.status !== "ready") throw new Error("No local capture is ready");
+    const identity = identityFrom(state);
+    const stored = await this.#store.get(resolvedTabId);
+    if (
+      !stored ||
+      stored.runId !== identity.runId ||
+      stored.tabId !== resolvedTabId
+    ) {
+      throw new Error("Local capture expired");
+    }
 
     await this.#setState(
-      reduceExtensionState(this.#state, { type: "prepare-clipboard", identity }),
+      resolvedTabId,
+      reduceExtensionState(state, { type: "prepare-clipboard", identity }),
     );
     try {
       const payload = await this.#clipboard(stored.plan);
+      const latest = await this.#store.get(resolvedTabId);
+      if (latest?.runId !== identity.runId || latest.tabId !== resolvedTabId) {
+        throw new Error("Local capture was replaced");
+      }
       await this.#setState(
-        reduceExtensionState(this.#state, { type: "clipboard-complete", identity }),
+        resolvedTabId,
+        reduceExtensionState(this.getState(resolvedTabId), {
+          type: "clipboard-complete",
+          identity,
+        }),
       );
       return payload;
     } catch (error) {
-      await this.#setState(
-        reduceExtensionState(this.#state, {
-          type: "clipboard-failed",
-          identity,
-          message: "Clipboard payload could not be prepared.",
-        }),
-      );
+      const current = this.getState(resolvedTabId);
+      if (current.status === "preparing-clipboard") {
+        await this.#setState(
+          resolvedTabId,
+          reduceExtensionState(current, {
+            type: "clipboard-failed",
+            identity,
+            message: "Clipboard payload could not be prepared.",
+          }),
+        );
+      }
       throw error;
     }
   }
 
-  async clear(): Promise<void> {
-    await this.#cleanupDebugger();
-    await this.#store.clear();
-    await this.#setState(initialExtensionState());
+  async clear(tabId?: number): Promise<void> {
+    const resolvedTabId = this.#resolveTabId(tabId);
+    if (resolvedTabId === null) return;
+    await this.#cleanupDebugger(resolvedTabId);
+    await this.#withResultLock(async () => {
+      await this.#store.clear(resolvedTabId);
+      await this.#scheduleNextResultExpiry();
+    });
+    await this.#setState(resolvedTabId, initialExtensionState());
+  }
+
+  async handleResultExpiry(): Promise<void> {
+    await this.#withResultLock(async () => {
+      await this.#store.cleanupExpired();
+      const storedPlans = await this.#store.getAll();
+      const plansByTab = new Map(storedPlans.map((stored) => [stored.tabId, stored]));
+      let changed = false;
+      for (const [tabId, state] of this.#states) {
+        if (
+          (state.status === "ready" || state.status === "preparing-clipboard") &&
+          plansByTab.get(tabId)?.runId !== state.runId
+        ) {
+          this.#states.delete(tabId);
+          changed = true;
+        }
+      }
+      await this.#scheduleNextResultExpiry(storedPlans);
+      if (changed) await this.#persistStates();
+    });
+  }
+
+  async handlePageChange(tabId: number): Promise<void> {
+    if (this.#sessions.has(tabId)) {
+      await this.failIfCaptureDocumentChanged(tabId);
+      return;
+    }
+    if (this.getState(tabId).status !== "idle") await this.clear(tabId);
+  }
+
+  async removeTab(tabId: number): Promise<void> {
+    await this.#cleanupDebugger(tabId);
+    await this.#withResultLock(async () => {
+      await this.#store.clear(tabId);
+      await this.#scheduleNextResultExpiry();
+    });
+    await this.#setState(tabId, initialExtensionState());
   }
 
   async failForPageChange(tabId: number, removed: boolean): Promise<void> {
-    if (this.#session?.tabId !== tabId) return;
+    if (!this.#sessions.has(tabId)) return;
+    if (removed) {
+      await this.removeTab(tabId);
+      return;
+    }
     await this.#failSession(
+      tabId,
       removed ? "tab-closed" : "page-changed",
       removed ? "The captured tab was closed." : "The page changed during capture.",
+      this.#sessions.get(tabId)?.runId,
     );
   }
 
   async failIfCaptureDocumentChanged(tabId: number): Promise<void> {
-    const identity = this.#session?.identity;
+    const identity = this.#sessions.get(tabId)?.identity;
     if (!identity || identity.tabId !== tabId) return;
 
     const documentId = await this.#platform
       .getCurrentDocumentId(tabId)
       .catch(() => null);
-    const currentIdentity = this.#session?.identity;
+    const currentIdentity = this.#sessions.get(tabId)?.identity;
     if (
       !currentIdentity ||
       currentIdentity.runId !== identity.runId ||
@@ -317,16 +427,29 @@ export class BackgroundController {
   }
 
   getActiveTabId(): number | null {
-    return this.#session?.tabId ?? null;
+    return this.#sessions.size === 1 ? this.#sessions.keys().next().value ?? null : null;
+  }
+
+  hasActiveSession(tabId: number): boolean {
+    return this.#sessions.has(tabId);
   }
 
   async #completeCapture(document: CaptureDocument, identity: CaptureRunIdentity): Promise<void> {
     if (!isCaptureDocument(document)) {
-      await this.#failSession("invalid-capture", "The page returned invalid capture data.");
+      await this.#failSession(
+        identity.tabId,
+        "invalid-capture",
+        "The page returned invalid capture data.",
+        identity.runId,
+      );
       return;
     }
     await this.#setState(
-      reduceExtensionState(this.#state, { type: "capture-complete", identity }),
+      identity.tabId,
+      reduceExtensionState(this.getState(identity.tabId), {
+        type: "capture-complete",
+        identity,
+      }),
     );
 
     let plan: RenderPlan;
@@ -334,67 +457,86 @@ export class BackgroundController {
       plan = this.#convert(document);
     } catch {
       await this.#failSession(
+        identity.tabId,
         "conversion-failed",
         "A page structure could not be converted locally.",
+        identity.runId,
       );
       return;
     }
 
     try {
-      const stored = await this.#store.put(plan, {
-        ...identity,
-        mode: this.#session?.mode ?? "visible-area",
+      const session = this.#sessions.get(identity.tabId);
+      const mode = session?.mode ?? "visible-area";
+      await this.#withResultLock(async () => {
+        if (!this.#acceptsIdentity(identity)) return;
+        const stored = await this.#store.put(plan, { ...identity, mode });
+        if (!this.#acceptsIdentity(identity)) {
+          const current = await this.#store.get(identity.tabId);
+          if (current?.runId === identity.runId) {
+            await this.#store.clear(identity.tabId);
+            await this.#scheduleNextResultExpiry();
+          }
+          return;
+        }
+        await this.#setState(
+          identity.tabId,
+          reduceExtensionState(this.getState(identity.tabId), {
+            type: "conversion-complete",
+            identity,
+            createdAt: stored.createdAt,
+            expiresAt: stored.expiresAt,
+            warningCount: countVisualWarningDetails(plan.warnings),
+          }),
+        );
+        await this.#scheduleNextResultExpiry();
       });
-      if (!this.acceptsContentIdentity(identity, {
-        tabId: identity.tabId,
-        documentId: identity.documentId,
-      })) {
-        const current = await this.#store.getCurrent();
-        if (current?.runId === identity.runId) await this.#store.clear();
-        return;
-      }
-      await this.#setState(
-        reduceExtensionState(this.#state, {
-          type: "conversion-complete",
-          identity,
-          createdAt: stored.createdAt,
-          expiresAt: stored.expiresAt,
-          warningCount: countVisualWarningDetails(plan.warnings),
-        }),
-      );
-      await this.#cleanupDebugger();
+      await this.#cleanupDebugger(identity.tabId, identity.runId);
     } catch (error) {
       if (error instanceof RenderPlanTooLargeError) {
         await this.#failSession(
+          identity.tabId,
           "plan-too-large",
           `The converted result is ${formatMegabytes(error.actualBytes)}, above the ${formatMegabytes(error.maxBytes)} local limit.`,
+          identity.runId,
         );
         return;
       }
       await this.#failSession(
+        identity.tabId,
         "storage-failed",
         "Chrome could not save the converted result locally.",
+        identity.runId,
       );
     }
   }
 
-  async #failSession(code: ExtensionErrorCode, message: string): Promise<void> {
-    const identity = this.#session?.identity;
-    if (identity && (this.#state.status === "capturing" || this.#state.status === "converting")) {
+  async #failSession(
+    tabId: number,
+    code: ExtensionErrorCode,
+    message: string,
+    expectedRunId?: string,
+  ): Promise<void> {
+    const session = this.#sessions.get(tabId);
+    if (expectedRunId !== undefined && session?.runId !== expectedRunId) return;
+    const identity = session?.identity;
+    const state = this.getState(tabId);
+    if (identity && (state.status === "capturing" || state.status === "converting")) {
       await this.#setState(
-        reduceExtensionState(this.#state, { type: "run-failed", identity, code, message }),
+        tabId,
+        reduceExtensionState(state, { type: "run-failed", identity, code, message }),
       );
     } else {
-      await this.#setState({ status: "error", code, message });
+      await this.#setState(tabId, { status: "error", code, message });
     }
-    await this.#store.clear();
-    await this.#cleanupDebugger();
+    await this.#cleanupDebugger(tabId, expectedRunId ?? session?.runId);
   }
 
-  async #cleanupDebugger(): Promise<void> {
-    const session = this.#session;
+  async #cleanupDebugger(tabId: number, expectedRunId?: string): Promise<void> {
+    const session = this.#sessions.get(tabId);
     if (!session) return;
-    this.#session = null;
+    if (expectedRunId !== undefined && session.runId !== expectedRunId) return;
+    this.#sessions.delete(tabId);
     if (session.metricsApplied) {
       await this.#platform
         .sendDebuggerCommand(session.tabId, "Emulation.clearDeviceMetricsOverride", {})
@@ -410,9 +552,95 @@ export class BackgroundController {
     }
   }
 
-  async #setState(state: ExtensionState): Promise<void> {
-    this.#state = state;
-    await this.#platform.saveState(state);
+  async #setState(tabId: number, state: ExtensionState): Promise<void> {
+    if (state.status === "idle") this.#states.delete(tabId);
+    else this.#states.set(tabId, state);
+    await this.#persistStates();
+  }
+
+  async #restorePersistedStates(): Promise<void> {
+    const raw = await this.#platform.loadStates().catch(() => null);
+    if (!isRecord(raw)) return;
+    for (const [key, value] of Object.entries(raw)) {
+      const tabId = Number(key);
+      if (!Number.isInteger(tabId) || !isExtensionState(value) || value.status === "idle") continue;
+      if ("tabId" in value && value.tabId !== tabId) continue;
+      if (
+        value.status === "capturing" ||
+        value.status === "converting"
+      ) {
+        this.#states.set(tabId, value);
+        this.#sessions.set(tabId, {
+          tabId,
+          runId: value.runId,
+          mode: value.mode,
+          attached: true,
+          metricsApplied: true,
+          mediaApplied: true,
+          identity: identityFrom(value),
+        });
+      } else {
+        this.#states.set(tabId, value);
+      }
+    }
+  }
+
+  async #persistStates(): Promise<void> {
+    const snapshot = Object.fromEntries(
+      [...this.#states.entries()].map(([tabId, state]) => [String(tabId), state]),
+    );
+    const write = this.#stateWrite.then(() => this.#platform.saveStates(snapshot));
+    this.#stateWrite = write.catch(() => undefined);
+    await write;
+  }
+
+  async #clearStoredResultForNewCapture(tabId: number): Promise<void> {
+    await this.#withResultLock(async () => {
+      await this.#store.clear(tabId);
+      await this.#scheduleNextResultExpiry();
+    });
+  }
+
+  async #scheduleNextResultExpiry(storedPlans?: readonly StoredRenderPlan[]): Promise<void> {
+    const plans = storedPlans ?? (await this.#store.getAll());
+    const nextExpiry = plans.reduce(
+      (earliest, stored) => Math.min(earliest, stored.expiresAt),
+      Number.POSITIVE_INFINITY,
+    );
+    if (Number.isFinite(nextExpiry)) {
+      await this.#platform.scheduleResultExpiry(nextExpiry);
+    } else {
+      await this.#platform.clearResultExpiry();
+    }
+  }
+
+  #acceptsIdentity(identity: CaptureRunIdentity): boolean {
+    const current = this.#sessions.get(identity.tabId)?.identity;
+    return (
+      current?.runId === identity.runId &&
+      current.tabId === identity.tabId &&
+      current.documentId === identity.documentId
+    );
+  }
+
+  async #withResultLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#resultLock;
+    let release: () => void = () => undefined;
+    this.#resultLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  #resolveTabId(tabId?: number): number | null {
+    if (Number.isInteger(tabId)) return tabId ?? null;
+    const candidates = new Set([...this.#states.keys(), ...this.#sessions.keys()]);
+    return candidates.size === 1 ? candidates.values().next().value ?? null : null;
   }
 }
 
@@ -431,4 +659,8 @@ function isHttpUrl(value: string): boolean {
 
 function formatMegabytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

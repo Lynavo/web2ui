@@ -7,6 +7,18 @@ export const EXTENSION_STATUSES = [
   "error",
 ] as const;
 
+export const EXTENSION_ERROR_CODES = [
+  "unsupported-page",
+  "permission-denied",
+  "page-changed",
+  "tab-closed",
+  "capture-failed",
+  "invalid-capture",
+  "conversion-failed",
+  "plan-too-large",
+  "storage-failed",
+] as const;
+
 export type ExtensionStatus = (typeof EXTENSION_STATUSES)[number];
 export type CaptureMode = "visible-area" | "full-page";
 
@@ -52,16 +64,7 @@ export interface PreparingClipboardExtensionState extends ActiveStateBase {
   warningCount: number;
 }
 
-export type ExtensionErrorCode =
-  | "unsupported-page"
-  | "permission-denied"
-  | "page-changed"
-  | "tab-closed"
-  | "capture-failed"
-  | "invalid-capture"
-  | "conversion-failed"
-  | "plan-too-large"
-  | "storage-failed";
+export type ExtensionErrorCode = (typeof EXTENSION_ERROR_CODES)[number];
 
 export interface ErrorExtensionState {
   status: "error";
@@ -111,6 +114,41 @@ export type ExtensionEvent =
 
 export function initialExtensionState(): IdleExtensionState {
   return { status: "idle" };
+}
+
+export function isExtensionState(value: unknown): value is ExtensionState {
+  if (!isRecord(value) || !EXTENSION_STATUSES.includes(value.status as ExtensionStatus)) {
+    return false;
+  }
+  if (value.status === "idle") return Object.keys(value).length === 1;
+  if (value.status === "error") {
+    return (
+      EXTENSION_ERROR_CODES.includes(value.code as ExtensionErrorCode) &&
+      typeof value.message === "string"
+    );
+  }
+  if (!hasValidActiveIdentity(value)) return false;
+  if (value.mode !== "visible-area" && value.mode !== "full-page") return false;
+  if (value.status === "capturing") {
+    return (
+      isFiniteNumber(value.startedAt) &&
+      isFiniteNumber(value.progress) &&
+      value.progress >= 0 &&
+      value.progress <= 1 &&
+      typeof value.label === "string"
+    );
+  }
+  if (value.status === "converting") return isFiniteNumber(value.startedAt);
+  return (
+    isFiniteNumber(value.createdAt) &&
+    isFiniteNumber(value.expiresAt) &&
+    typeof value.warningCount === "number" &&
+    Number.isInteger(value.warningCount) &&
+    value.warningCount >= 0 &&
+    (value.status !== "ready" ||
+      ((value.copyResult === undefined || value.copyResult === "copied" || value.copyResult === "failed") &&
+        (value.copyError === undefined || typeof value.copyError === "string")))
+  );
 }
 
 export function reduceExtensionState(
@@ -216,4 +254,23 @@ function readyFromClipboardState(
     warningCount: state.warningCount,
     ...copy,
   };
+}
+
+function hasValidActiveIdentity(value: Record<string, unknown>): boolean {
+  return (
+    typeof value.runId === "string" &&
+    value.runId.length > 0 &&
+    Number.isInteger(value.tabId) &&
+    Number(value.tabId) >= 0 &&
+    typeof value.documentId === "string" &&
+    value.documentId.length > 0
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

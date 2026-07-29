@@ -388,7 +388,7 @@ export function App() {
   const [theme, setTheme] = useState<ThemeChoice>("browser");
   const [browserViewportWidth, setBrowserViewportWidth] = useState<number | null>(null);
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
-  const version = extensionApi?.runtime.getManifest().version ?? "0.1.2";
+  const version = extensionApi?.runtime.getManifest().version ?? "0.1.3";
 
   const refresh = useCallback(async () => {
     if (!extensionApi) return;
@@ -441,10 +441,12 @@ export function App() {
 
   const onCopy = async () => {
     if (!extensionApi) return;
+    if (!("tabId" in state)) return;
     setCopyStatus("copying");
     try {
       const response = (await extensionApi.runtime.sendMessage({
         type: "prepare-clipboard",
+        tabId: state.tabId,
       })) as PopupResponse;
       if (!response.ok || !("payload" in response)) throw new Error("Clipboard payload unavailable");
       await writeFigmaClipboardPayload(response.payload as FigmaClipboardPayload);
@@ -459,7 +461,11 @@ export function App() {
 
   const onClear = async () => {
     if (!extensionApi) return;
-    const response = (await extensionApi.runtime.sendMessage({ type: "clear-result" })) as PopupResponse;
+    if (!("tabId" in state)) return;
+    const response = (await extensionApi.runtime.sendMessage({
+      type: "clear-result",
+      tabId: state.tabId,
+    })) as PopupResponse;
     if (response.ok) setState({ status: "idle" });
     setCopyStatus("idle");
   };
