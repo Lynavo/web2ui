@@ -82,22 +82,36 @@ function plan(id = "test"): RenderPlan {
 
 class MemoryPlanStore implements LocalPlanStore {
   current: StoredRenderPlan | null = null;
-  clear = vi.fn(async () => {
+  records = new Map<number, StoredRenderPlan>();
+  clear = vi.fn(async (tabId?: number) => {
+    if (Number.isInteger(tabId)) {
+      const resolvedTabId = tabId as number;
+      this.records.delete(resolvedTabId);
+      if (this.current?.tabId === resolvedTabId) this.current = null;
+      return;
+    }
+    this.records.clear();
     this.current = null;
   });
-  getCurrent = vi.fn(async () => this.current);
+  get = vi.fn(async (tabId: number) => this.records.get(tabId) ?? (this.current?.tabId === tabId ? this.current : null));
+  getAll = vi.fn(async () => {
+    const values = [...this.records.values()];
+    if (this.current && !values.some((record) => record.tabId === this.current?.tabId)) values.push(this.current);
+    return values;
+  });
   put = vi.fn(
     async (
       value: RenderPlan,
       identity: { runId: string; tabId: number; documentId: string; mode: "visible-area" | "full-page" },
     ) => {
       this.current = {
-        id: "current",
+        id: `tab:${identity.tabId}`,
         ...identity,
         createdAt: 1_000,
         expiresAt: 1_000 + 24 * 60 * 60 * 1_000,
         plan: value,
       };
+      this.records.set(identity.tabId, this.current);
       return this.current;
     },
   );
@@ -116,7 +130,10 @@ function platform(overrides: Partial<BackgroundPlatform> = {}): BackgroundPlatfo
     detachDebugger: vi.fn(async () => undefined),
     injectContent: vi.fn(async () => ({ documentId: "document_current" })),
     sendCaptureCommand: vi.fn(async () => undefined),
-    saveState: vi.fn(async () => undefined),
+    loadStates: vi.fn(async () => ({})),
+    saveStates: vi.fn(async () => undefined),
+    scheduleResultExpiry: vi.fn(async () => undefined),
+    clearResultExpiry: vi.fn(async () => undefined),
     ...overrides,
   };
 }
@@ -258,6 +275,49 @@ describe("BackgroundController", () => {
     });
   });
 
+  it("restores an active capture identity after service-worker restart", async () => {
+    const target = platform({
+      loadStates: vi.fn(async () => ({
+        "7": {
+          status: "capturing",
+          runId: "run_saved",
+          tabId: 7,
+          documentId: "document_saved",
+          mode: "visible-area",
+          startedAt: 1_000,
+          progress: 0.35,
+          label: "Reading the page",
+        },
+      })),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store: new MemoryPlanStore(),
+      convert: () => plan("saved"),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await controller.initialize();
+    await controller.handleContentMessage(
+      {
+        type: "capture-progress",
+        runId: "run_saved",
+        tabId: 7,
+        documentId: "document_saved",
+        progress: 0.7,
+        label: "Reading styles",
+      },
+      { tabId: 7, documentId: "document_saved" },
+    );
+
+    expect(controller.getState(7)).toMatchObject({
+      status: "capturing",
+      runId: "run_saved",
+      progress: 0.7,
+      label: "Reading styles",
+    });
+  });
+
   it("keeps the ready plan retryable when async clipboard preparation fails", async () => {
     const store = new MemoryPlanStore();
     store.current = {
@@ -369,6 +429,299 @@ describe("BackgroundController", () => {
       message: "The converted result is 28.0 MB, above the 25.0 MB local limit.",
     });
   });
+
+  it("keeps capture runs and progress isolated by source tab", async () => {
+    let activeTabId = 7;
+    let runSequence = 0;
+    const target = platform({
+      getActiveTab: vi.fn(async () => ({
+        id: activeTabId,
+        url: `https://fixture.invalid/tab-${activeTabId}`,
+      })),
+      nextRunId: () => `run_${++runSequence}`,
+      injectContent: vi.fn(async (tabId) => ({ documentId: `document_${tabId}` })),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store: new MemoryPlanStore(),
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    activeTabId = 8;
+    await controller.startCapture("full-page", DEFAULT_CAPTURE_OPTIONS);
+
+    await controller.handleContentMessage(
+      {
+        type: "capture-progress",
+        runId: "run_1",
+        tabId: 7,
+        documentId: "document_7",
+        progress: 0.42,
+        label: "Reading tab A",
+      },
+      { tabId: 7, documentId: "document_7" },
+    );
+
+    expect(controller.getState(7)).toMatchObject({
+      status: "capturing",
+      progress: 0.42,
+      label: "Reading tab A",
+    });
+    expect(controller.getState(8)).toMatchObject({
+      status: "capturing",
+      runId: "run_2",
+      mode: "full-page",
+    });
+    expect(controller.getState(9)).toEqual({ status: "idle" });
+  });
+
+  it("does not replace another tab's ready result with a protected-page error", async () => {
+    let activeTab = { id: 7, url: "https://fixture.invalid/source" };
+    const store = new MemoryPlanStore();
+    const target = platform({
+      getActiveTab: vi.fn(async () => activeTab),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store,
+      convert: () => plan("source"),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await completeCapture(controller);
+    activeTab = { id: 10, url: "chrome://settings" };
+    await expect(
+      controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS),
+    ).rejects.toThrow("Unsupported page");
+
+    expect(controller.getState(7).status).toBe("ready");
+    expect(controller.getState(10)).toMatchObject({
+      status: "error",
+      code: "unsupported-page",
+    });
+    expect(store.current?.runId).toBe("run_current");
+  });
+
+  it("keeps A, B, and C independent while a protected D tab is opened", async () => {
+    let activeTabId = 1;
+    let runSequence = 0;
+    const store = new MemoryPlanStore();
+    const target = platform({
+      getActiveTab: vi.fn(async () => ({
+        id: activeTabId,
+        url: activeTabId === 4 ? "chrome://settings" : `https://fixture.invalid/tab-${activeTabId}`,
+      })),
+      nextRunId: () => `run_${++runSequence}`,
+      injectContent: vi.fn(async (tabId) => ({ documentId: `document_${tabId}` })),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store,
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    activeTabId = 2;
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    activeTabId = 3;
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+
+    for (const tabId of [1, 2]) {
+      await controller.handleContentMessage(
+        {
+          type: "capture-progress",
+          runId: `run_${tabId}`,
+          tabId,
+          documentId: `document_${tabId}`,
+          progress: 0.5,
+          label: `Reading tab ${tabId}`,
+        },
+        { tabId, documentId: `document_${tabId}` },
+      );
+    }
+    await finishTab(controller, 3, "run_3");
+
+    activeTabId = 4;
+    await expect(controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS)).rejects.toThrow(
+      "Unsupported page",
+    );
+
+    expect(controller.getState(1)).toMatchObject({ status: "capturing", progress: 0.5 });
+    expect(controller.getState(2)).toMatchObject({ status: "capturing", progress: 0.5 });
+    expect(controller.getState(3)).toMatchObject({ status: "ready", runId: "run_3" });
+    expect(controller.getState(4)).toMatchObject({ status: "error", code: "unsupported-page" });
+    expect(store.records.get(3)?.runId).toBe("run_3");
+  });
+
+  it("keeps completed results isolated when a later tab completes", async () => {
+    let activeTabId = 7;
+    let runSequence = 0;
+    const store = new MemoryPlanStore();
+    const target = platform({
+      getActiveTab: vi.fn(async () => ({
+        id: activeTabId,
+        url: `https://fixture.invalid/tab-${activeTabId}`,
+      })),
+      nextRunId: () => `run_${++runSequence}`,
+      injectContent: vi.fn(async (tabId) => ({ documentId: `document_${tabId}` })),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store,
+      convert: () => plan(`tab-${activeTabId}`),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    activeTabId = 8;
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    await finishTab(controller, 7, "run_1");
+    expect(controller.getState(7).status).toBe("ready");
+
+    await finishTab(controller, 8, "run_2");
+
+    expect(controller.getState(7).status).toBe("ready");
+    expect(controller.getState(8).status).toBe("ready");
+    expect(store.records.get(7)?.runId).toBe("run_1");
+    expect(store.records.get(8)?.runId).toBe("run_2");
+  });
+
+  it("clears stale ready UI state when the stored local result expires", async () => {
+    const store = new MemoryPlanStore();
+    const target = platform();
+    const controller = new BackgroundController({
+      platform: target,
+      store,
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+    await completeCapture(controller);
+    expect(controller.getState(7).status).toBe("ready");
+
+    store.records.clear();
+    store.current = null;
+    await controller.handleResultExpiry();
+
+    expect(controller.getState(7)).toEqual({ status: "idle" });
+    expect(target.clearResultExpiry).toHaveBeenCalled();
+  });
+
+  it("clears ready data only when its source tab navigates", async () => {
+    const store = new MemoryPlanStore();
+    const controller = new BackgroundController({
+      platform: platform(),
+      store,
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+    await completeCapture(controller);
+
+    await controller.handlePageChange(8);
+    expect(controller.getState(7).status).toBe("ready");
+    expect(store.current?.tabId).toBe(7);
+
+    await controller.handlePageChange(7);
+    expect(controller.getState(7)).toEqual({ status: "idle" });
+    expect(store.current).toBeNull();
+  });
+
+  it("clears ready data only when its source tab closes", async () => {
+    const store = new MemoryPlanStore();
+    const controller = new BackgroundController({
+      platform: platform(),
+      store,
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+    await completeCapture(controller);
+
+    await controller.removeTab(8);
+    expect(controller.getState(7).status).toBe("ready");
+    expect(store.current?.tabId).toBe(7);
+
+    await controller.removeTab(7);
+    expect(controller.getState(7)).toEqual({ status: "idle" });
+    expect(store.current).toBeNull();
+  });
+
+  it("fails only the capture whose document changed", async () => {
+    let activeTabId = 7;
+    let runSequence = 0;
+    const target = platform({
+      getActiveTab: vi.fn(async () => ({
+        id: activeTabId,
+        url: `https://fixture.invalid/tab-${activeTabId}`,
+      })),
+      nextRunId: () => `run_${++runSequence}`,
+      injectContent: vi.fn(async (tabId) => ({ documentId: `document_${tabId}` })),
+      getCurrentDocumentId: vi.fn(async (tabId) =>
+        tabId === 7 ? "document_replaced" : `document_${tabId}`,
+      ),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store: new MemoryPlanStore(),
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    activeTabId = 8;
+    await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    await controller.handlePageChange(7);
+
+    expect(controller.getState(7)).toMatchObject({ status: "error", code: "page-changed" });
+    expect(controller.getState(8)).toMatchObject({ status: "capturing", runId: "run_2" });
+    expect(controller.hasActiveSession(7)).toBe(false);
+    expect(controller.hasActiveSession(8)).toBe(true);
+  });
+
+  it("keeps capture state isolated across twenty tabs and retains one final result", async () => {
+    let activeTabId = 1;
+    const store = new MemoryPlanStore();
+    const target = platform({
+      getActiveTab: vi.fn(async () => ({
+        id: activeTabId,
+        url: `https://fixture.invalid/tab-${activeTabId}`,
+      })),
+      nextRunId: () => `run_${activeTabId}`,
+      injectContent: vi.fn(async (tabId) => ({ documentId: `document_${tabId}` })),
+    });
+    const controller = new BackgroundController({
+      platform: target,
+      store,
+      convert: () => plan(),
+      clipboard: () => ({ svg: "<svg/>", html: "<svg/>", text: "<svg/>" }),
+    });
+
+    for (activeTabId = 1; activeTabId <= 20; activeTabId += 1) {
+      await controller.startCapture("visible-area", DEFAULT_CAPTURE_OPTIONS);
+    }
+    for (let tabId = 1; tabId <= 20; tabId += 1) {
+      await controller.handleContentMessage(
+        {
+          type: "capture-progress",
+          runId: `run_${tabId}`,
+          tabId,
+          documentId: `document_${tabId}`,
+          progress: tabId / 20,
+          label: `Reading tab ${tabId}`,
+        },
+        { tabId, documentId: `document_${tabId}` },
+      );
+    }
+    for (let tabId = 1; tabId <= 20; tabId += 1) {
+      await finishTab(controller, tabId, `run_${tabId}`);
+    }
+
+    for (let tabId = 1; tabId <= 20; tabId += 1) {
+      expect(controller.getState(tabId)).toMatchObject({ status: "ready", runId: `run_${tabId}` });
+    }
+    expect(store.records.size).toBe(20);
+  });
 });
 
 async function completeCapture(controller: BackgroundController): Promise<void> {
@@ -382,5 +735,22 @@ async function completeCapture(controller: BackgroundController): Promise<void> 
       document: capture(),
     },
     { tabId: 7, documentId: "document_current" },
+  );
+}
+
+async function finishTab(
+  controller: BackgroundController,
+  tabId: number,
+  runId: string,
+): Promise<void> {
+  await controller.handleContentMessage(
+    {
+      type: "capture-done",
+      runId,
+      tabId,
+      documentId: `document_${tabId}`,
+      document: capture(),
+    },
+    { tabId, documentId: `document_${tabId}` },
   );
 }

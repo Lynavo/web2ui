@@ -25,8 +25,8 @@ export type PopupMessage =
   | { type: "get-state" }
   | { type: "get-active-tab-viewport" }
   | { type: "start-capture"; mode: CaptureMode; options?: CaptureOptions }
-  | { type: "prepare-clipboard" }
-  | { type: "clear-result" };
+  | { type: "prepare-clipboard"; tabId: number }
+  | { type: "clear-result"; tabId: number };
 
 export const CONTENT_MESSAGE_TYPES = [
   "capture-progress",
@@ -87,9 +87,10 @@ export function isPopupMessage(value: unknown): value is PopupMessage {
   switch (value.type) {
     case "get-state":
     case "get-active-tab-viewport":
+      return hasOnlyKeys(value, ["type"]);
     case "prepare-clipboard":
     case "clear-result":
-      return hasOnlyKeys(value, ["type"]);
+      return hasOnlyKeys(value, ["type", "tabId"]) && isTabId(value.tabId);
     case "start-capture":
       return (
         hasOnlyKeys(value, ["type", "mode", "options"]) &&
@@ -99,6 +100,10 @@ export function isPopupMessage(value: unknown): value is PopupMessage {
     default:
       return false;
   }
+}
+
+function isTabId(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0;
 }
 
 function isCaptureOptions(value: unknown): value is CaptureOptions {

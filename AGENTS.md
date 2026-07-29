@@ -51,8 +51,9 @@ responsible document in the same change.
 - Content messages are accepted only for the active run, tab, and document identity. Never weaken
   this three-part check.
 - Asset reads omit credentials, accept only HTTP(S), and remain bounded by byte and time limits.
-- The extension stores at most one current RenderPlan. Retention, size limits, explicit clearing,
-  and expiry alarms must remain aligned across code, tests, README, and PRIVACY.
+- The extension stores at most one bounded RenderPlan per source tab. Retention, size limits,
+  explicit per-tab clearing, and expiry alarms must remain aligned across code, tests, README, and
+  PRIVACY.
 - All executable release code is packaged locally. Do not introduce `eval`, dynamic remote
   imports, remote scripts, source maps, secrets, or machine-local paths into `dist/`.
 

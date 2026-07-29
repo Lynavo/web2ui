@@ -3273,7 +3273,7 @@ export async function extractCaptureInPage(
       // instead of failing to decode them as raster bytes downstream.
       if (mediaType === "image/svg+xml" && headerEnd >= 0) {
         const payload = src.slice(headerEnd + 1);
-        let markup: string | null = null;
+        let markup: string | null;
         try {
           markup = header.includes("base64") ? atob(payload) : decodeURIComponent(payload);
         } catch {
@@ -3402,7 +3402,7 @@ export async function extractCaptureInPage(
         scaleMode: "fill",
       };
     }
-    let markup: string | null = null;
+    let markup: string | null;
     try {
       const clone = element.cloneNode(true) as SVGSVGElement;
 

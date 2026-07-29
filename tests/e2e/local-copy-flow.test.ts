@@ -37,6 +37,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  server.closeAllConnections();
   await new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
@@ -48,12 +49,12 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
     async () => {
       const evidence: Array<{ url: string; method: string; body: string | null; headers: Record<string, string> }> = [];
       const consoleMessages: string[] = [];
-      let { context, extensionId } = await launchExtension(userDataDir);
+      const { context, extensionId } = await launchExtension(userDataDir);
       observeContext(context, evidence, consoleMessages);
-      let target = await openFixture(context);
+      const target = await openFixture(context);
       await target.screenshot({ path: path.join(artifacts, "visible-source.png") });
 
-      let popup = await openExtensionPopup(context, extensionId);
+      const popup = await openExtensionPopup(context, extensionId);
       await target.bringToFront();
       await popup.evaluate(() => window.dispatchEvent(new Event("focus")));
       await popup.getByText("⚡ 1280px").waitFor({ state: "visible" });
@@ -115,6 +116,7 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
         state: "visible",
         timeout: 10_000,
       });
+      await popup.screenshot({ path: path.join(artifacts, "visible-copied-popup.png") });
       const visiblePayload = await requestClipboardPayload(popup);
       const visibleSize = svgSize(visiblePayload.svg);
       expect(visibleSize.width).toBe(390);
@@ -156,13 +158,10 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
         true,
       );
 
-      await popup.close();
-      await context.close();
-
-      ({ context, extensionId } = await launchExtension(userDataDir));
-      observeContext(context, evidence, consoleMessages);
-      target = await openFixture(context);
-      popup = await openExtensionPopup(context, extensionId);
+      await restartExtensionServiceWorker(context, extensionId, target);
+      await target.bringToFront();
+      await popup.reload({ waitUntil: "domcontentloaded" });
+      await popup.evaluate(() => window.dispatchEvent(new Event("focus")));
       await popup.getByRole("button", { name: "Copy for Figma" }).waitFor({
         state: "visible",
         timeout: 10_000,
@@ -175,6 +174,62 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
       expect(evidence.map(({ url }) => url).join("\n")).not.toMatch(
         /web2ui\.lynavo\.io|workers\.dev|r2\.dev|cloudflarestorage\.com/iu,
       );
+      await context.close();
+    },
+    120_000,
+  );
+
+  it(
+    "keeps A, B, and C state independent when protected D is opened",
+    async () => {
+      const profile = path.join(artifacts, "multi-tab-profile");
+      await rm(profile, { recursive: true, force: true });
+      const { context, extensionId } = await launchExtension(profile);
+      const popup = await openExtensionPopup(context, extensionId);
+      const tabA = await openFixture(context);
+      const tabB = await openFixture(context);
+      const tabC = await openFixture(context);
+      const tabD = await openFixture(context);
+
+      await startCaptureOnTab(popup, tabA, "visible-area");
+      await startCaptureOnTab(popup, tabB, "visible-area");
+      await startCaptureOnTab(popup, tabC, "visible-area");
+      await waitForReadyOnTab(popup, tabA);
+      await waitForReadyOnTab(popup, tabB);
+      await waitForReadyOnTab(popup, tabC);
+
+      const beforeProtected = await Promise.all([
+        readStateOnTab(popup, tabA),
+        readStateOnTab(popup, tabB),
+        readStateOnTab(popup, tabC),
+      ]);
+      expect(beforeProtected.map((response) => response.state?.status)).toEqual([
+        "ready",
+        "ready",
+        "ready",
+      ]);
+
+      await tabD.goto("about:blank");
+      await tabD.bringToFront();
+      const blocked = await popup.evaluate(async () =>
+        chrome.runtime.sendMessage({ type: "start-capture", mode: "visible-area" }),
+      );
+      expect(blocked).toMatchObject({ ok: false });
+
+      const afterProtected = await Promise.all([
+        readStateOnTab(popup, tabA),
+        readStateOnTab(popup, tabB),
+        readStateOnTab(popup, tabC),
+      ]);
+      expect(afterProtected.map((response) => response.state?.status)).toEqual([
+        "ready",
+        "ready",
+        "ready",
+      ]);
+      expect(afterProtected.map((response) => response.state?.tabId)).toEqual(
+        beforeProtected.map((response) => response.state?.tabId),
+      );
+
       await context.close();
     },
     120_000,
@@ -212,6 +267,36 @@ async function openExtensionPopup(context: BrowserContext, extensionId: string):
   return popup;
 }
 
+async function restartExtensionServiceWorker(
+  context: BrowserContext,
+  extensionId: string,
+  target: Page,
+): Promise<void> {
+  const session = await context.newCDPSession(target);
+  const version = new Promise<{ versionId: string }>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("extension service worker version unavailable")),
+      10_000,
+    );
+    session.on("ServiceWorker.workerVersionUpdated", ({ versions }) => {
+      const match = versions.find((candidate) => {
+        try {
+          return new URL(candidate.scriptURL).host === extensionId;
+        } catch {
+          return false;
+        }
+      });
+      if (!match) return;
+      clearTimeout(timeout);
+      resolve(match);
+    });
+  });
+  await session.send("ServiceWorker.enable");
+  const { versionId } = await version;
+  await session.send("ServiceWorker.stopWorker", { versionId });
+  await session.detach();
+}
+
 async function clickInInactivePopup(popup: Page, name: string): Promise<void> {
   const button = popup.getByRole("button", { name });
   await button.waitFor({ state: "visible" });
@@ -220,7 +305,18 @@ async function clickInInactivePopup(popup: Page, name: string): Promise<void> {
 
 async function requestClipboardPayload(popup: Page): Promise<{ svg: string; html: string; text: string }> {
   return popup.evaluate(async () => {
-    const response = (await chrome.runtime.sendMessage({ type: "prepare-clipboard" })) as {
+    const stateResponse = (await chrome.runtime.sendMessage({ type: "get-state" })) as {
+      ok: boolean;
+      state?: { tabId?: number };
+    };
+    const tabId = stateResponse.state?.tabId;
+    if (!stateResponse.ok || !Number.isInteger(tabId)) {
+      throw new Error("ready tab unavailable");
+    }
+    const response = (await chrome.runtime.sendMessage({
+      type: "prepare-clipboard",
+      tabId,
+    })) as {
       ok: boolean;
       payload?: { svg: string; html: string; text: string };
     };
@@ -255,6 +351,45 @@ async function waitForReadyState(
   throw new Error(
     `capture did not become ready: ${JSON.stringify(lastState)}; console: ${consoleMessages.join(" | ")}`,
   );
+}
+
+async function startCaptureOnTab(
+  popup: Page,
+  target: Page,
+  mode: "visible-area" | "full-page",
+): Promise<void> {
+  await target.bringToFront();
+  const response = await popup.evaluate(async (captureMode) =>
+    chrome.runtime.sendMessage({ type: "start-capture", mode: captureMode }), mode);
+  if (typeof response !== "object" || response === null || !("state" in response)) {
+    throw new Error(`capture did not start: ${JSON.stringify(response)}`);
+  }
+}
+
+async function readStateOnTab(
+  popup: Page,
+  target: Page,
+): Promise<{ ok: boolean; state?: { status?: string; tabId?: number } }> {
+  await target.bringToFront();
+  return popup.evaluate(async () => chrome.runtime.sendMessage({ type: "get-state" })) as Promise<{
+    ok: boolean;
+    state?: { status?: string; tabId?: number };
+  }>;
+}
+
+async function waitForReadyOnTab(popup: Page, target: Page): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastResponse: unknown = null;
+  while (Date.now() < deadline) {
+    const response = await readStateOnTab(popup, target);
+    lastResponse = response;
+    if (response.state?.status === "ready") return;
+    if (response.state?.status === "error") {
+      throw new Error(`tab capture entered error state: ${JSON.stringify(response)}`);
+    }
+    await popup.waitForTimeout(250);
+  }
+  throw new Error(`tab capture did not become ready: ${JSON.stringify(lastResponse)}`);
 }
 
 function svgSize(svg: string): { width: number; height: number } {

@@ -13,13 +13,16 @@ label. These facts are used only to produce the requested clipboard result.
 
 ## Local storage and deletion
 
-Small UI preferences are stored with Chrome extension storage. The current portable RenderPlan
-is stored in IndexedDB. Only one result is retained, and it becomes inaccessible after 24 hours.
-An extension alarm schedules deletion at that deadline while the browser is running; if the alarm
-is delayed because the browser is closed or suspended, the next extension activation rejects and
-deletes the expired result before it can be used. Starting a new capture replaces the previous
-result, and the user can choose **Clear local data** at any time. Interrupted and failed captures
-are discarded.
+Small UI preferences and per-tab capture status are stored with Chrome extension storage. The
+status contains identifiers, progress, timestamps, warnings, and local error text, not captured
+page content. Each source tab's portable RenderPlan is stored in IndexedDB under that tab's local
+record, and every result becomes inaccessible after 24 hours.
+An extension alarm schedules deletion at the next result deadline while the browser is running; if
+the alarm is delayed because the browser is closed or suspended, the next extension activation
+rejects and deletes expired results before they can be used. Starting a new capture replaces only
+that source tab's result. Switching tabs does not cancel an active capture. Unsupported-page and
+capture errors are isolated to their source tab and do not delete a ready result owned by another
+tab. Interrupted and failed capture content is discarded.
 
 ## Network requests
 

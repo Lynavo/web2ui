@@ -72,7 +72,7 @@ conversion server may be inappropriate. Web2UI keeps the workflow inspectable an
 
 - capture begins only after an explicit user action;
 - page structure is measured and converted inside the extension;
-- one bounded result is retained locally for no more than 24 hours;
+- one bounded result per source tab is retained locally for no more than 24 hours;
 - clipboard access occurs only after the user clicks **Copy for Figma**;
 - captured page content is not sent to a Web2UI-operated server.
 
@@ -178,8 +178,13 @@ Do not move or delete the extracted directory while the extension is installed. 
 7. Click **Copy for Figma**.
 8. Open Figma and paste into the target canvas.
 
-Starting a capture replaces the previous result. Select **Clear local data** to delete the current
-result immediately.
+Starting a capture replaces the previous result for that source tab.
+
+Capture progress and errors belong to the source tab. Switching to another tab shows that tab's
+home or error view without cancelling captures already running elsewhere; returning to a source
+tab restores its progress. The extension may run captures and retain completed RenderPlans in
+several tabs at once. An unsupported-page error in another tab does not delete an existing ready
+result.
 
 Browser-internal pages such as `chrome://`, the Chrome Web Store, some PDF viewers, and some
 enterprise-managed pages do not allow extension injection and cannot be captured.
@@ -207,9 +212,10 @@ flowchart LR
 ```
 
 The service worker accepts capture messages only when the random run ID, Chrome tab ID, and
-document ID all match the active session. Navigation, tab closure, debugger detachment, or a newer
-capture invalidates the previous run. Temporary emulation, debugger attachment, capture markers,
-hidden overlays, and scroll changes are cleaned up on success and failure paths.
+document ID all match that tab's active session. Switching tabs does not cancel a run. Navigation
+or closure of the source tab, debugger detachment, or a superseding run in that same tab
+invalidates it. Temporary emulation, debugger attachment, capture markers, hidden overlays, and
+scroll changes are cleaned up on success and failure paths.
 
 | Module | Responsibility |
 | --- | --- |
@@ -227,13 +233,12 @@ Local-first does not mean fully offline: the service worker may request an HTTP(
 font, or CSS asset declared by the selected page when the injected runtime cannot read it
 directly. These requests omit credentials and referrer data and enforce byte and time limits.
 
-The extension stores small interface preferences with Chrome extension storage and one validated
-portable RenderPlan in IndexedDB. The result:
+The extension stores small interface preferences and per-tab capture state with Chrome extension
+storage. Each source tab's validated portable RenderPlan is stored in IndexedDB. Every result:
 
 - is limited to 25 MiB;
 - expires after 24 hours;
-- is replaced when a new capture starts;
-- can be removed immediately with **Clear local data**;
+- is replaced when a new capture starts in that source tab;
 - is rejected and deleted on the next activation if its expiry alarm was delayed.
 
 Read [PRIVACY.md](PRIVACY.md) for the complete data-handling statement and
@@ -247,12 +252,12 @@ The manifest intentionally requests only the interfaces needed by the local capt
 | Permission | Purpose |
 | --- | --- |
 | `activeTab` | Limits page interaction to the active tab selected by the user. |
-| `alarms` | Schedules deletion of the current result after its 24-hour lifetime. |
+| `alarms` | Schedules deletion of each stored result after its 24-hour lifetime. |
 | `clipboardWrite` | Writes the generated payload after the user clicks **Copy for Figma**. |
 | `debugger` | Applies temporary viewport/theme emulation and captures bounded screenshot fallbacks. |
 | `scripting` | Injects the packaged capture runtime after an explicit capture action. |
 | `storage` | Stores small interface preferences and current extension state. |
-| `unlimitedStorage` | Allows one local RenderPlan of up to 25 MiB without relying on a small storage quota. |
+| `unlimitedStorage` | Allows local RenderPlans of up to 25 MiB each without relying on a small storage quota. |
 | `<all_urls>` | Operates on the selected HTTP(S) page and recovers assets it declares, including cross-origin CDN assets. |
 
 The `debugger` attachment may cause Chrome to display a browser banner during capture. Web2UI
@@ -268,7 +273,7 @@ Permission changes are treated as security-sensitive and enforced by repository 
 | Total recovered inline assets | Approximately 18 MiB |
 | Portable RenderPlan | 25 MiB |
 | Screenshot fallback nodes | 12 |
-| Stored results | 1 |
+| Stored results | 1 per source tab |
 | Result lifetime | 24 hours |
 
 Canvas, video, WebGL, unsupported SVG, very large assets, browser-only effects, unavailable fonts,
@@ -311,8 +316,8 @@ when clicking **Copy for Figma**, and paste directly into the Figma canvas.
 
 ### A previous result disappeared
 
-Only one result is retained. It is replaced by a new capture, removed by **Clear local data**, and
-expires after 24 hours. Web2UI cannot recover an expired or cleared result.
+Each source tab retains its own result. It is replaced by a new capture in that tab and expires
+after 24 hours. Web2UI cannot recover an expired result.
 
 </details>
 
