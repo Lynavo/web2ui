@@ -154,6 +154,11 @@ describe("BackgroundController", () => {
     });
     expect(store.clear).toHaveBeenCalledOnce();
     expect(target.attachDebugger).toHaveBeenCalledWith(7);
+    expect(target.sendDebuggerCommand).toHaveBeenCalledWith(
+      7,
+      "Emulation.setDeviceMetricsOverride",
+      expect.objectContaining({ width: 1280, height: 720 }),
+    );
     expect(target.sendCaptureCommand).toHaveBeenCalledWith(
       7,
       "document_current",

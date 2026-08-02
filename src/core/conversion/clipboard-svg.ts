@@ -600,7 +600,7 @@ function paintToFill(
       return ` fill="url(#${id})" fill-opacity="${num(paint.opacity)}"`;
     } else {
       context.defs.push(
-        `<linearGradient id="${id}" gradientUnits="objectBoundingBox" x1="0" y1="0" x2="1" y2="0"${gradientTransformAttr(
+        `<linearGradient id="${id}" gradientUnits="objectBoundingBox" x1="0" y1="0.5" x2="1" y2="0.5"${gradientTransformAttr(
           paint,
         )}>${stops}</linearGradient>`,
       );
@@ -614,7 +614,15 @@ function paintToFill(
 
 function gradientTransformAttr(paint: FigmaGradientPaint): string {
   const [[a, c, e], [b, d, f]] = paint.gradientTransform;
-  return ` gradientTransform="matrix(${num(a)} ${num(b)} ${num(c)} ${num(d)} ${num(e)} ${num(f)})"`;
+  const determinant = a * d - b * c;
+  if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-9) return "";
+  const inverseA = d / determinant;
+  const inverseB = -b / determinant;
+  const inverseC = -c / determinant;
+  const inverseD = a / determinant;
+  const inverseE = (c * f - d * e) / determinant;
+  const inverseF = (b * e - a * f) / determinant;
+  return ` gradientTransform="matrix(${num(inverseA)} ${num(inverseB)} ${num(inverseC)} ${num(inverseD)} ${num(inverseE)} ${num(inverseF)})"`;
 }
 
 /**

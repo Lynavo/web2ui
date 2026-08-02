@@ -220,7 +220,7 @@ async function captureElementScreenshot(
     const result = (await platform.sendDebuggerCommand(tabId, "Page.captureScreenshot", {
       format: "png",
       fromSurface: true,
-      captureBeyondViewport: true,
+      captureBeyondViewport: false,
       clip: { ...rect, scale: 1 },
     })) as { data?: unknown };
     if (typeof result.data !== "string") return { ok: false };

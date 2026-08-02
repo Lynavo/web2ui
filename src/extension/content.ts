@@ -10,7 +10,6 @@ import {
 } from "../core/capture/consent-overlays.js";
 import {
   decodeCaptureInlineAssetData,
-  isSafeSvgMarkup,
   type CaptureAsset,
   type CaptureWarning,
   type PageRect,
@@ -20,15 +19,20 @@ import {
   MAX_ASSET_BYTES,
   MAX_TOTAL_ASSET_BYTES,
   buildAssetWarnings,
-  buildResolvedCaptureAsset,
   collectAssetNodeIds,
-  normalizeMediaType,
+  normalizeCaptureAsset,
+  partitionCaptureInlineAssets,
+  type CaptureAssetRasterizer,
 } from "./content-assets.js";
 import {
+  captureAncestorScrollPositions,
   cleanupCaptureMarkers,
   findCaptureMarker,
   localStaticSettleDelayMs,
   resolveLocalStaticScreenshotFallbacks,
+  restoreAncestorHorizontalScroll,
+  restoreAncestorScrollPositions,
+  screenshotFallbackPageClip,
   type ScreenshotFallbackNode,
 } from "./content-fallbacks.js";
 import {
@@ -145,7 +149,9 @@ async function resolveAssets(
     return true;
   };
 
-  for (const inline of extraction.inlineAssets) {
+  const addInlineAsset = async (
+    inline: (typeof extraction.inlineAssets)[number],
+  ): Promise<void> => {
     const sourceBytes = decodeCaptureInlineAssetData(inline.data, inline.mediaType);
     if (sourceBytes === null || sourceBytes.byteLength > MAX_ASSET_BYTES) {
       warnings.push(
@@ -155,31 +161,28 @@ async function resolveAssets(
           nodeIdsByAsset,
         ),
       );
-      continue;
+      return;
     }
-    const mediaType = normalizeMediaType(inline.mediaType);
-    const isSvg = mediaType === "image/svg+xml" || inline.kind === "svg-inline";
-    let data = inline.data;
-    if (isSvg) {
-      data = new TextDecoder().decode(sourceBytes);
-      if (!isSafeSvgMarkup(data)) {
-        warnings.push(...buildAssetWarnings("asset_fetch_failed", inline.assetId, nodeIdsByAsset));
-        continue;
-      }
-    } else if (!mediaType.startsWith("image/") || !inline.data.startsWith("data:")) {
+    const asset = await normalizeCaptureAsset(
+      {
+        assetId: inline.assetId,
+        sourceKind: inline.kind,
+        bytes: sourceBytes,
+        mediaType: inline.mediaType,
+        ...(inline.naturalWidth === undefined ? {} : { naturalWidth: inline.naturalWidth }),
+        ...(inline.naturalHeight === undefined ? {} : { naturalHeight: inline.naturalHeight }),
+      },
+      rasterizeCaptureAssetInBrowser,
+    );
+    if (asset === null) {
       warnings.push(...buildAssetWarnings("asset_fetch_failed", inline.assetId, nodeIdsByAsset));
-      continue;
+      return;
     }
-    addAsset({
-      assetId: inline.assetId,
-      kind: isSvg ? (inline.kind === "svg-inline" ? "svg-inline" : "svg-image") : "raster-image",
-      data,
-      mediaType: isSvg ? "image/svg+xml" : mediaType,
-      byteSize: sourceBytes.byteLength,
-      ...(inline.naturalWidth === undefined ? {} : { naturalWidth: inline.naturalWidth }),
-      ...(inline.naturalHeight === undefined ? {} : { naturalHeight: inline.naturalHeight }),
-    });
-  }
+    addAsset(asset);
+  };
+
+  const inlineAssets = partitionCaptureInlineAssets(extraction.inlineAssets);
+  for (const inline of inlineAssets.primary) await addInlineAsset(inline);
 
   const remoteResults = await mapWithConcurrency(
     extraction.assetRequests,
@@ -197,13 +200,25 @@ async function resolveAssets(
       warnings.push(...buildAssetWarnings("asset_fetch_failed", request.assetId, nodeIdsByAsset));
       continue;
     }
-    const asset = buildResolvedCaptureAsset(request, result.bytes, result.contentType);
+    const asset = await normalizeCaptureAsset(
+      {
+        assetId: request.assetId,
+        sourceKind: request.kind,
+        bytes: result.bytes,
+        mediaType: result.contentType,
+        ...(request.tint === undefined ? {} : { tint: request.tint }),
+        ...(request.naturalWidth === undefined ? {} : { naturalWidth: request.naturalWidth }),
+        ...(request.naturalHeight === undefined ? {} : { naturalHeight: request.naturalHeight }),
+      },
+      rasterizeCaptureAssetInBrowser,
+    );
     if (!asset) {
       warnings.push(...buildAssetWarnings("asset_fetch_failed", request.assetId, nodeIdsByAsset));
       continue;
     }
     addAsset(asset);
   }
+  for (const inline of inlineAssets.deferred) await addInlineAsset(inline);
   return { assets, warnings };
 }
 
@@ -217,7 +232,8 @@ async function fetchRemoteAsset(
     const timeout = setTimeout(() => controller.abort(), 10_000);
     try {
       const response = await fetch(request.url, {
-        credentials: "include",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
         signal: controller.signal,
       });
       if (!response.ok) throw new Error("asset response failed");
@@ -242,6 +258,63 @@ async function fetchRemoteAsset(
   }
 }
 
+const rasterizeCaptureAssetInBrowser: CaptureAssetRasterizer = async ({
+  bytes,
+  mediaType,
+  tint,
+}) => {
+  const ownedBytes = new Uint8Array(bytes);
+  const objectUrl = URL.createObjectURL(new Blob([ownedBytes.buffer], { type: mediaType }));
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const candidate = new Image();
+      const timeout = setTimeout(() => reject(new Error("image decode timed out")), 5_000);
+      candidate.decoding = "async";
+      candidate.onload = () => {
+        clearTimeout(timeout);
+        resolve(candidate);
+      };
+      candidate.onerror = () => {
+        clearTimeout(timeout);
+        reject(new Error("image decode failed"));
+      };
+      candidate.src = objectUrl;
+    });
+    const width = image.naturalWidth;
+    const height = image.naturalHeight;
+    if (
+      width < 1 ||
+      height < 1 ||
+      width > 8_192 ||
+      height > 8_192 ||
+      width * height > 16_000_000
+    ) {
+      return null;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (context === null) return null;
+    context.drawImage(image, 0, 0, width, height);
+    if (tint !== undefined) {
+      context.globalCompositeOperation = "source-in";
+      context.fillStyle = tint;
+      context.fillRect(0, 0, width, height);
+      context.globalCompositeOperation = "source-over";
+    }
+    const dataUrl = canvas.toDataURL("image/png");
+    const payload = dataUrl.slice(dataUrl.indexOf(",") + 1);
+    const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+    const byteSize = Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
+    return { dataUrl, byteSize, naturalWidth: width, naturalHeight: height };
+  } catch {
+    return null;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+};
+
 async function resolveFallbacks(
   root: InPageExtractionResult["root"],
   assets: CaptureAsset[],
@@ -265,19 +338,43 @@ async function captureScreenshotFallback(
   request: ScreenshotFallbackNode,
   command: RunCaptureCommand,
 ): Promise<string | null> {
-  const element = findCaptureMarker(request.nodeId);
+  const element = findCaptureMarker(request.nodeId, document, request.kind);
   if (!(element instanceof HTMLElement)) return null;
-  element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-  await sleep(localStaticSettleDelayMs(request.tag));
-  await nextAnimationFrame();
-  const clip = viewportClip(element.getBoundingClientRect());
-  if (!clip) return null;
-
-  const restoreOverlaps = request.preserveBackdrop ? () => undefined : hideOverlappingElements(element);
+  const ancestorScrollPositions = captureAncestorScrollPositions(element);
   try {
-    return await captureElementRect(clip, command);
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    // scrollIntoView may pan authored horizontal scrollers. Restore their
+    // capture-time state before reading pixels, while retaining the vertical
+    // positioning that made the fallback region available to Chromium.
+    restoreAncestorHorizontalScroll(ancestorScrollPositions);
+    await sleep(localStaticSettleDelayMs(request.tag));
+    await nextAnimationFrame();
+    const liveRect = element.getBoundingClientRect();
+    const clip = screenshotFallbackPageClip(
+      request.rect,
+      { x: liveRect.left, y: liveRect.top, width: liveRect.width, height: liveRect.height },
+      { x: window.scrollX, y: window.scrollY },
+    );
+    if (!clip) return null;
+
+    const restoreOverlaps = request.preserveBackdrop
+      ? () => undefined
+      : hideOverlappingElements(element);
+    const restoreBackgroundIsolation =
+      request.kind === "background-host"
+        ? isolateElementBackground(element)
+        : () => undefined;
+    try {
+      return await captureElementRect(clip, command);
+    } finally {
+      try {
+        restoreBackgroundIsolation();
+      } finally {
+        restoreOverlaps();
+      }
+    }
   } finally {
-    restoreOverlaps();
+    restoreAncestorScrollPositions(ancestorScrollPositions);
   }
 }
 
@@ -290,20 +387,6 @@ async function captureElementRect(
     rect,
   });
   return response.ok ? response.dataUrl ?? null : null;
-}
-
-function viewportClip(rect: DOMRect): PageRect | null {
-  const left = Math.max(0, rect.left);
-  const top = Math.max(0, rect.top);
-  const right = Math.min(window.innerWidth, rect.right);
-  const bottom = Math.min(window.innerHeight, rect.bottom);
-  if (right - left < 1 || bottom - top < 1) return null;
-  return {
-    x: left + window.scrollX,
-    y: top + window.scrollY,
-    width: right - left,
-    height: bottom - top,
-  };
 }
 
 function hideOverlappingElements(target: HTMLElement): () => void {
@@ -329,6 +412,52 @@ function hideOverlappingElements(target: HTMLElement): () => void {
     for (const { element, value, priority } of changed) {
       if (value) element.style.setProperty("opacity", value, priority);
       else element.style.removeProperty("opacity");
+    }
+  };
+}
+
+function isolateElementBackground(element: HTMLElement): () => void {
+  const isolationAttribute = "data-web2ui-local-background-isolation";
+  const token = `capture-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const previousIsolationValue = element.getAttribute(isolationAttribute);
+  const previousHostStyle = element.getAttribute("style");
+  const descendants = Array.from(element.querySelectorAll<HTMLElement>("*"));
+  const previousDescendantStyles = descendants.map((descendant) => ({
+    descendant,
+    style: descendant.getAttribute("style"),
+  }));
+  const style = document.createElement("style");
+  style.textContent =
+    `[${isolationAttribute}="${token}"]::before,` +
+    `[${isolationAttribute}="${token}"]::after{visibility:hidden!important;content:none!important}`;
+
+  element.setAttribute(isolationAttribute, token);
+  element.style.setProperty("color", "transparent", "important");
+  element.style.setProperty("text-shadow", "none", "important");
+  element.style.setProperty("border-color", "transparent", "important");
+  element.style.setProperty("border-image-source", "none", "important");
+  element.style.setProperty("box-shadow", "none", "important");
+  element.style.setProperty("outline", "none", "important");
+  element.style.setProperty("filter", "none", "important");
+  element.style.setProperty("backdrop-filter", "none", "important");
+  element.style.setProperty("mix-blend-mode", "normal", "important");
+  element.style.setProperty("opacity", "1", "important");
+  for (const descendant of descendants) {
+    descendant.style.setProperty("visibility", "hidden", "important");
+  }
+  const styleRoot = element.getRootNode();
+  if (styleRoot instanceof ShadowRoot) styleRoot.append(style);
+  else document.head.append(style);
+
+  return () => {
+    style.remove();
+    if (previousHostStyle === null) element.removeAttribute("style");
+    else element.setAttribute("style", previousHostStyle);
+    if (previousIsolationValue === null) element.removeAttribute(isolationAttribute);
+    else element.setAttribute(isolationAttribute, previousIsolationValue);
+    for (const { descendant, style: previousStyle } of previousDescendantStyles) {
+      if (previousStyle === null) descendant.removeAttribute("style");
+      else descendant.setAttribute("style", previousStyle);
     }
   };
 }

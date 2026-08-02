@@ -1234,6 +1234,64 @@ export async function extractCaptureInPage(
     };
   }
 
+  function extractLegacyRectClipBounds(
+    style: CSSStyleDeclaration,
+    rect: DOMRect,
+  ): PageRect | undefined {
+    if (style.position !== "absolute" && style.position !== "fixed") return undefined;
+    const match = /^rect\((.*)\)$/iu.exec(style.clip.trim());
+    if (match === null) return undefined;
+    if (style.transform !== "none") {
+      try {
+        const matrix = new DOMMatrixReadOnly(style.transform);
+        if (
+          !matrix.is2D ||
+          Math.abs(matrix.a - 1) > 1e-6 ||
+          Math.abs(matrix.b) > 1e-6 ||
+          Math.abs(matrix.c) > 1e-6 ||
+          Math.abs(matrix.d - 1) > 1e-6
+        ) {
+          return undefined;
+        }
+      } catch {
+        return undefined;
+      }
+    }
+    const commaSeparated = splitTopLevel(match[1] ?? "", ",").map((token) => token.trim());
+    const tokens =
+      commaSeparated.length === 4
+        ? commaSeparated
+        : (match[1] ?? "").trim().split(/\s+/u).filter(Boolean);
+    if (tokens.length !== 4) return undefined;
+    const readEdge = (token: string, automatic: number): number | null => {
+      if (token.toLowerCase() === "auto") return automatic;
+      if (!/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:px)?$/iu.test(token)) return null;
+      const value = Number.parseFloat(token);
+      return Number.isFinite(value) ? value : null;
+    };
+    const top = readEdge(tokens[0] ?? "", 0);
+    const right = readEdge(tokens[1] ?? "", rect.width);
+    const bottom = readEdge(tokens[2] ?? "", rect.height);
+    const left = readEdge(tokens[3] ?? "", 0);
+    if (top === null || right === null || bottom === null || left === null) return undefined;
+    const width = right - left;
+    const height = bottom - top;
+    if (width <= 0 || height <= 0) return undefined;
+    return {
+      x: rect.left + scrollX + left,
+      y: rect.top + scrollY + top,
+      width,
+      height,
+    };
+  }
+
+  function extractRectangularClipBounds(
+    style: CSSStyleDeclaration,
+    rect: DOMRect,
+  ): PageRect | undefined {
+    return extractInsetClipBounds(style, rect) ?? extractLegacyRectClipBounds(style, rect);
+  }
+
   /** Parse CSS text-shadow (no inset/spread) into shadow layers. */
   function extractTextShadows(style: CSSStyleDeclaration): Shadow[] | undefined {
     const raw = style.textShadow;
@@ -1435,7 +1493,7 @@ export async function extractCaptureInPage(
       );
     };
     const hasEscapingPositionedBand = (node: CaptureNode): boolean => {
-      if (node.zIndex !== undefined && node.zIndex >= 0) {
+      if (node.positioned === true && (node.zIndex ?? 0) >= 0) {
         return true;
       }
       if (node.type !== "element" || node.createsStackingContext === true) {
@@ -1575,7 +1633,11 @@ export async function extractCaptureInPage(
           const overlapsExternalPaint = peers.some(
             (peer) => hasPaintContribution(peer) && boundsOverlap(child.bounds, peer.bounds),
           );
-          if ((child.zIndex ?? 0) > 0 && overlapsExternalPaint) {
+          if (
+            child.positioned === true &&
+            (child.zIndex ?? 0) >= 0 &&
+            overlapsExternalPaint
+          ) {
             nestedSequence.value += 1;
             escaping.push({
               node: child,
@@ -1609,7 +1671,7 @@ export async function extractCaptureInPage(
           ...escaping.map(({ node, sequence }) => ({
             node,
             sequence,
-            level: node.zIndex,
+            level: ownStackLevel(node),
             layoutOrder: 0,
           })),
         ];
@@ -3238,6 +3300,7 @@ export async function extractCaptureInPage(
     const cornerRadii = extractCornerRadii(style, rect.width, rect.height);
     const borders = extractBorders(style);
     const shadows = extractShadows(style);
+    const clipBounds = extractRectangularClipBounds(style, rect);
     const base = {
       id: nodeId,
       type: "image" as const,
@@ -3250,6 +3313,7 @@ export async function extractCaptureInPage(
       ...(cornerRadii !== undefined ? { cornerRadii } : {}),
       ...(borders !== undefined ? { borders } : {}),
       ...(shadows !== undefined ? { shadows } : {}),
+      ...(clipBounds !== undefined ? { clipBounds } : {}),
       ...(element.naturalWidth > 0 ? { naturalWidth: element.naturalWidth } : {}),
       ...(element.naturalHeight > 0 ? { naturalHeight: element.naturalHeight } : {}),
       ...(element.alt ? { altText: element.alt } : {}),
@@ -3882,6 +3946,21 @@ export async function extractCaptureInPage(
     return hosts;
   }
 
+  function nearestClipClusterOwner(
+    boundary: Element,
+    hosts: readonly Element[],
+  ): Element | null {
+    let candidate = hosts[0]?.parentElement ?? null;
+    while (candidate !== null) {
+      if (hosts.every((host) => candidate?.contains(host) === true)) {
+        return boundary.contains(candidate) ? candidate : null;
+      }
+      if (candidate === boundary) break;
+      candidate = candidate.parentElement;
+    }
+    return null;
+  }
+
   function clippedSubtreeClusterPaintRect(
     element: Element,
     hosts: Element[],
@@ -3921,6 +4000,9 @@ export async function extractCaptureInPage(
     // dense clip-path card cluster that escapes the host border box.
     const hosts = collectUnsupportedClipPathHosts(element);
     if (hosts.length < 8) {
+      return null;
+    }
+    if (nearestClipClusterOwner(element, hosts) !== element) {
       return null;
     }
     const hostRect = element.getBoundingClientRect();
@@ -4097,6 +4179,7 @@ export async function extractCaptureInPage(
     parentRect: DOMRect,
     parentStyle: CSSStyleDeclaration,
     which: "before" | "after",
+    requireTransform = true,
   ): DOMRect | null {
     let style: CSSStyleDeclaration;
     try {
@@ -4110,7 +4193,7 @@ export async function extractCaptureInPage(
       style.content === "normal" ||
       style.display === "none" ||
       style.visibility === "hidden" ||
-      style.transform === "none"
+      (requireTransform && style.transform === "none")
     ) {
       return null;
     }
@@ -4154,10 +4237,13 @@ export async function extractCaptureInPage(
       left = fragment?.left ?? (which === "before" ? parentRect.left : parentRect.right - size.width);
       top = fragment?.top ?? parentRect.top;
     }
-    return transformedBorderBoxRect(
-      new DOMRect(left, top, size.width, size.height),
-      style,
-    );
+    const borderBox = new DOMRect(left, top, size.width, size.height);
+    const paintRect =
+      style.transform === "none" ? borderBox : transformedBorderBoxRect(borderBox, style);
+    if (paintRect === null) return null;
+    const blurMatch = /blur\((\d+(?:\.\d+)?)px\)/.exec(style.filter);
+    const blurPx = blurMatch?.[1] === undefined ? 0 : Number.parseFloat(blurMatch[1]);
+    return blurPx > 0 ? expandedFilterPaintRect(paintRect, blurPx) : paintRect;
   }
 
   function transformedPseudoFallbackRect(
@@ -4171,6 +4257,32 @@ export async function extractCaptureInPage(
     let bottom = parentRect.bottom;
     for (const which of ["before", "after"] as const) {
       const pseudoRect = transformedPseudoPaintRect(element, parentRect, parentStyle, which);
+      if (pseudoRect === null) continue;
+      left = Math.min(left, pseudoRect.left);
+      top = Math.min(top, pseudoRect.top);
+      right = Math.max(right, pseudoRect.right);
+      bottom = Math.max(bottom, pseudoRect.bottom);
+    }
+    return new DOMRect(left, top, right - left, bottom - top);
+  }
+
+  function generatedPseudoFallbackRect(
+    element: Element,
+    parentRect: DOMRect,
+    parentStyle: CSSStyleDeclaration,
+  ): DOMRect {
+    let left = parentRect.left;
+    let top = parentRect.top;
+    let right = parentRect.right;
+    let bottom = parentRect.bottom;
+    for (const which of ["before", "after"] as const) {
+      const pseudoRect = transformedPseudoPaintRect(
+        element,
+        parentRect,
+        parentStyle,
+        which,
+        false,
+      );
       if (pseudoRect === null) continue;
       left = Math.min(left, pseudoRect.left);
       top = Math.min(top, pseudoRect.top);
@@ -4259,7 +4371,33 @@ export async function extractCaptureInPage(
     return false;
   }
 
-  function hasUnsupportedPseudoMask(element: Element): boolean {
+  function hasBrowserResolvedGeneratedPseudoContent(element: Element): boolean {
+    for (const which of ["before", "after"] as const) {
+      let pseudoStyle: CSSStyleDeclaration;
+      try {
+        pseudoStyle = getComputedStyle(element, `::${which}`);
+      } catch {
+        continue;
+      }
+      if (
+        !pseudoStyle.content ||
+        pseudoStyle.content === "none" ||
+        pseudoStyle.content === "normal" ||
+        pseudoStyle.display === "none" ||
+        pseudoStyle.visibility === "hidden" ||
+        Number.parseFloat(pseudoStyle.opacity) === 0
+      ) {
+        continue;
+      }
+      if (!parseGeneratedContentText(pseudoStyle.content).complete) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function unsupportedPseudoMaskKinds(element: Element): Array<"before" | "after"> {
+    const kinds: Array<"before" | "after"> = [];
     for (const which of ["before", "after"] as const) {
       let pseudoStyle: CSSStyleDeclaration;
       try {
@@ -4276,10 +4414,35 @@ export async function extractCaptureInPage(
         continue;
       }
       if (requiresMaskedSubtreeFallback(pseudoStyle)) {
-        return true;
+        kinds.push(which);
       }
     }
-    return false;
+    return kinds;
+  }
+
+  function isThinDecorativeMaskedPseudo(
+    element: Element,
+    which: "before" | "after",
+  ): boolean {
+    let style: CSSStyleDeclaration;
+    try {
+      style = getComputedStyle(element, `::${which}`);
+    } catch {
+      return false;
+    }
+    const size = pseudoBorderBoxSize(style);
+    const thinDimension = Math.min(size.width, size.height);
+    if (thinDimension <= 0 || thinDimension > 2) {
+      return false;
+    }
+    const backdropFilter = style.getPropertyValue("backdrop-filter");
+    return (
+      (!style.filter || style.filter === "none") &&
+      (!backdropFilter || backdropFilter === "none") &&
+      (!style.boxShadow || style.boxShadow === "none") &&
+      (!style.textShadow || style.textShadow === "none") &&
+      (!style.outlineStyle || style.outlineStyle === "none")
+    );
   }
 
   function walkScreenshotFallbackElement(
@@ -4943,7 +5106,29 @@ export async function extractCaptureInPage(
         },
       );
     }
-    if (hasUnsupportedPseudoMask(element)) {
+    if (hasBrowserResolvedGeneratedPseudoContent(element)) {
+      return walkScreenshotFallbackElement(
+        element,
+        style,
+        generatedPseudoFallbackRect(element, rect, style),
+        "generated-pseudo",
+        {
+          code: "unsupported_paint",
+          detail:
+            "browser-resolved pseudo-element content cannot be represented structurally; screenshot fallback",
+        },
+      );
+    }
+    const unsupportedPseudoMasks = unsupportedPseudoMaskKinds(element);
+    const omittedThinMaskedPseudos = new Set(
+      unsupportedPseudoMasks.filter((which) =>
+        isThinDecorativeMaskedPseudo(element, which),
+      ),
+    );
+    if (
+      unsupportedPseudoMasks.length > 0 &&
+      omittedThinMaskedPseudos.size !== unsupportedPseudoMasks.length
+    ) {
       // Next.js Powered By cards: ::before uses dual linear-gradient masks +
       // mask-composite:exclude as a 1px conic border. Without the mask, the
       // opaque conic fill covers the card content.
@@ -5095,7 +5280,9 @@ export async function extractCaptureInPage(
       ? extractCornerRadii(style, rect.width, rect.height)
       : undefined;
     const nodeShadows = hasPrincipalBox ? extractShadows(style) : undefined;
-    const nodeClipBounds = hasPrincipalBox ? extractInsetClipBounds(style, rect) : undefined;
+    const nodeClipBounds = hasPrincipalBox
+      ? extractRectangularClipBounds(style, rect)
+      : undefined;
     const nodeLayout = hasPrincipalBox ? extractLayoutHint(style) : undefined;
     const nodePadding = hasPrincipalBox ? extractPadding(style) : undefined;
     // filter blur: decorative glow elements (e.g. a pill with blur(120px)
@@ -5199,6 +5386,15 @@ export async function extractCaptureInPage(
       ...extractStackingFacts(style, element.parentElement, element),
       children: [],
     };
+    if (omittedThinMaskedPseudos.size > 0) {
+      addWarning(
+        "unsupported_paint",
+        `thin masked pseudo-element omitted (${Array.from(omittedThinMaskedPseudos)
+          .map((which) => `::${which}`)
+          .join(", ")})`,
+        elementNodeId,
+      );
+    }
     if (nodeFills.some((fill) => fill.type === "image")) {
       const elementBindings =
         ((window as unknown as Record<string, unknown>).__h2fElementElements as
@@ -5299,7 +5495,9 @@ export async function extractCaptureInPage(
     }
     // Extract pseudo-elements with ::before preceding children and ::after
     // following them as an approximation of paint order.
-    const beforeNode = walkPseudoElement(element, rect, "before", style);
+    const beforeNode = omittedThinMaskedPseudos.has("before")
+      ? null
+      : walkPseudoElement(element, rect, "before", style);
     if (beforeNode) {
       elementNode.children.push(beforeNode);
     }
@@ -5524,7 +5722,9 @@ export async function extractCaptureInPage(
       }
     }
 
-    const afterNode = walkPseudoElement(element, rect, "after", style);
+    const afterNode = omittedThinMaskedPseudos.has("after")
+      ? null
+      : walkPseudoElement(element, rect, "after", style);
     if (afterNode) {
       elementNode.children.push(afterNode);
     }
@@ -5941,14 +6141,21 @@ export async function extractCaptureInPage(
    * If no definite size can be resolved and there is no text, skip the node,
    * record a warning, and never guess.
    */
-  function parseGeneratedContentText(value: string): string {
+  function parseGeneratedContentText(value: string): {
+    text: string;
+    complete: boolean;
+  } {
     let index = 0;
     let result = "";
     while (index < value.length) {
       while (/\s/.test(value[index] ?? "")) index += 1;
-      if (value[index] === "/") break;
+      if (value[index] === "/") {
+        return { text: result, complete: true };
+      }
       const quote = value[index];
-      if (quote !== '"' && quote !== "'") return result;
+      if (quote !== '"' && quote !== "'") {
+        return { text: result, complete: false };
+      }
       index += 1;
       let raw = "";
       let closed = false;
@@ -5971,10 +6178,10 @@ export async function extractCaptureInPage(
         raw += char;
         index += 1;
       }
-      if (!closed) return "";
+      if (!closed) return { text: "", complete: false };
       result += unescapeCssValue(raw);
     }
-    return result;
+    return { text: result, complete: true };
   }
 
   function pseudoBorderBoxSize(style: CSSStyleDeclaration): {
@@ -6131,7 +6338,7 @@ export async function extractCaptureInPage(
     // Computed content may include CSS alt text (`"glyph" / "label"`). Only
     // the generated string before `/` is painted; the alternate is exposed
     // to accessibility APIs and must never become visible glyph pixels.
-    const contentText = parseGeneratedContentText(content);
+    const contentText = parseGeneratedContentText(content).text;
     // Browser fact: inline elements expose one client rect per rendered line.
     // Those fragments include generated content, so the first/last fragment
     // gives the actual line that owns ::before/::after even when the host wraps.

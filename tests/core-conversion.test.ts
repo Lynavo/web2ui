@@ -277,6 +277,51 @@ describe("capture to render plan", () => {
     );
   });
 
+  it("wraps a clipped image in the browser-measured clip rectangle", () => {
+    const capture = makeCapture();
+    capture.assets.push({
+      assetId: "asset_clipped",
+      kind: "raster-image",
+      mediaType: "image/png",
+      byteSize: 1,
+      data: "data:image/png;base64,AA==",
+    });
+    capture.root.children.push({
+      id: "n_clipped_image",
+      type: "image",
+      tag: "img",
+      name: "Clipped image",
+      bounds: { x: 40, y: 30, width: 200, height: 100 },
+      clipBounds: { x: 60, y: 40, width: 130, height: 70 },
+      opacity: 1,
+      clipsContent: false,
+      assetId: "asset_clipped",
+      scaleMode: "fill",
+    });
+
+    const plan = convertCaptureToRenderPlan(capture);
+    const clipped = plan.root.children[1];
+
+    expect(clipped).toMatchObject({
+      type: "FRAME",
+      sourceNodeId: "n_clipped_image",
+      x: 60,
+      y: 40,
+      width: 130,
+      height: 70,
+      clipsContent: true,
+      children: [
+        {
+          type: "RECTANGLE",
+          x: -20,
+          y: -10,
+          width: 200,
+          height: 100,
+        },
+      ],
+    });
+  });
+
   it("preserves both fallback diagnostics for one node so the UI can count the region once", () => {
     const capture = makeCapture();
     capture.warnings = [

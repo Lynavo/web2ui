@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:http";
-import { readFile, mkdir, rm } from "node:fs/promises";
+import { readFile, mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type BrowserContext, type Page, type Worker } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -11,6 +11,9 @@ const fixturePath = path.join(root, "tests/e2e/fixtures/local-page.html");
 const artifacts = path.join(root, "out/e2e/playwright/local-copy");
 const userDataDir = path.join(artifacts, "browser-profile");
 const privateCanary = "PRIVATE_CANARY_DO_NOT_TRANSMIT_7F12";
+const fixturePngBase64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const fixturePngDataUrl = `data:image/png;base64,${fixturePngBase64}`;
 
 let server: Server;
 let fixtureUrl: string;
@@ -25,6 +28,11 @@ beforeAll(async () => {
     if (request.url === "/" || request.url === "/local-page.html") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       response.end(fixture);
+      return;
+    }
+    if (request.url === "/fixture-image.png") {
+      response.writeHead(200, { "content-type": "image/png" });
+      response.end(Buffer.from(fixturePngBase64, "base64"));
       return;
     }
     response.writeHead(404);
@@ -119,14 +127,21 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
       const visibleSize = svgSize(visiblePayload.svg);
       expect(visibleSize.width).toBe(390);
       expect(visibleSize.height).toBe(720);
+      expect(visiblePayload.svg).toContain(fixturePngDataUrl);
+      expect(countOccurrences(visiblePayload.svg, fixturePngDataUrl)).toBe(1);
+      expect(visiblePayload.svg).not.toMatch(/<image\b[^>]*\bhref="https?:/iu);
       await screenshotClipboardPreview(
-        context,
         visiblePayload.html,
         path.join(artifacts, "visible-clipboard-preview.png"),
-        false,
       );
 
       await popup.getByRole("button", { name: "Capture another page" }).click();
+      // Clearing Chrome's device metrics restores a real tab's physical
+      // viewport. Playwright's persistent context uses its own emulation, so
+      // restore that test-harness viewport explicitly before Browser mode.
+      await target.setViewportSize({ width: 1279, height: 720 });
+      await target.setViewportSize({ width: 1280, height: 720 });
+      expect(await target.evaluate(() => window.innerWidth)).toBe(1280);
       await popup.getByRole("button", { name: "Browser viewport and Browser theme" }).click();
       await popup.getByRole("radiogroup", { name: "Capture viewport" })
         .getByRole("radio", { name: /^Browser/u })
@@ -137,24 +152,40 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
       await popup.getByText("🎨 BROWSER").waitFor({ state: "visible" });
       await popup.getByRole("button", { name: "Browser viewport and Browser theme" }).click();
       await target.bringToFront();
+      expect(await target.evaluate(() => window.innerWidth)).toBe(1280);
       await target.screenshot({ path: path.join(artifacts, "full-page-source.png"), fullPage: true });
+      expect(await target.locator("#nested-scroll").evaluate((element) => element.scrollLeft)).toBe(96);
       await clickInInactivePopup(popup, "Capture full page");
       await waitForReadyState(popup, 30_000, consoleMessages);
+      expect(await target.locator("#nested-scroll").evaluate((element) => element.scrollLeft)).toBe(96);
       await popup.getByRole("button", { name: "Copy for Figma" }).waitFor({
         state: "visible",
         timeout: 30_000,
       });
       const fullPayload = await requestClipboardPayload(popup);
+      await writeFile(path.join(artifacts, "full-page-clipboard.svg"), fullPayload.svg);
       const fullSize = svgSize(fullPayload.svg);
+      const fullAssetIds = await requestStoredPlanAssetIds(popup);
       expect(fullSize.width).toBe(1280);
       expect(fullSize.height).toBeGreaterThan(2_000);
+      expect(fullAssetIds.some((assetId) => assetId.startsWith("shot-background-"))).toBe(true);
       expect(fullPayload.svg).toContain("Full-page end marker.");
-      await screenshotClipboardPreview(
-        context,
+      expect(countOccurrences(fullPayload.svg, "Full-page end marker.")).toBe(1);
+      expect(countOccurrences(fullPayload.svg, fixturePngDataUrl)).toBe(1);
+      expect(fullPayload.svg.match(/<image\b/gu)?.length ?? 0).toBeGreaterThanOrEqual(2);
+      expect(fullPayload.svg).not.toMatch(/<image\b[^>]*\bhref="https?:/iu);
+      const fullPreviewPixels = await screenshotClipboardPreview(
         fullPayload.html,
         path.join(artifacts, "full-page-clipboard-preview.png"),
-        true,
+        [
+          { x: 215, y: 1036 },
+          { x: 420, y: 850 },
+        ],
       );
+      expect(fullPreviewPixels, consoleMessages.join("\n")).toEqual([
+        { r: 23, g: 32, b: 51, a: 255 },
+        { r: 255, g: 255, b: 255, a: 255 },
+      ]);
 
       await popup.close();
       await context.close();
@@ -229,6 +260,31 @@ async function requestClipboardPayload(popup: Page): Promise<{ svg: string; html
   });
 }
 
+async function requestStoredPlanAssetIds(popup: Page): Promise<string[]> {
+  return popup.evaluate(async () => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("web2ui-extension", 1);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error ?? new Error("test database open failed"));
+    });
+    try {
+      const record = await new Promise<unknown>((resolve, reject) => {
+        const transaction = database.transaction("current-render-plan", "readonly");
+        const request = transaction.objectStore("current-render-plan").get("current");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error ?? new Error("test plan read failed"));
+      });
+      if (typeof record !== "object" || record === null || !("plan" in record)) return [];
+      const plan = record.plan as { assets?: Array<{ assetId?: unknown }> };
+      return (plan.assets ?? [])
+        .map((asset) => asset.assetId)
+        .filter((assetId): assetId is string => typeof assetId === "string");
+    } finally {
+      database.close();
+    }
+  });
+}
+
 async function waitForReadyState(
   popup: Page,
   timeout: number,
@@ -263,17 +319,50 @@ function svgSize(svg: string): { width: number; height: number } {
   return { width: Number(match[1]), height: Number(match[2]) };
 }
 
+function countOccurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
 async function screenshotClipboardPreview(
-  context: BrowserContext,
   html: string,
   output: string,
-  fullPage: boolean,
-): Promise<void> {
-  const page = await context.newPage();
-  await page.setViewportSize({ width: 1280, height: 720 });
-  await page.setContent(`<style>html,body{margin:0;background:#fff}svg{display:block}</style>${html}`);
-  await page.screenshot({ path: output, fullPage });
-  await page.close();
+  samples?: ReadonlyArray<{ x: number; y: number }>,
+): Promise<Array<{ r: number; g: number; b: number; a: number }> | undefined> {
+  // Keep evidence independent from the extension's persistent context: that
+  // context intentionally receives transient debugger viewport emulation.
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+    await page.setContent(
+      `<style>html,body{margin:0;background:#fff}svg{display:block}</style>${html}`,
+    );
+    const screenshot = await page.locator("svg").screenshot({ path: output });
+    if (samples === undefined) return undefined;
+    const pixels = await page.evaluate(
+      async ({ dataUrl, samples: requestedSamples }) => {
+        const image = new Image();
+        image.src = dataUrl;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d");
+        if (context === null) throw new Error("preview pixel canvas unavailable");
+        context.drawImage(image, 0, 0);
+        return requestedSamples.map(({ x, y }) => {
+          const [r = 0, g = 0, b = 0, a = 0] = context.getImageData(x, y, 1, 1).data;
+          return { r, g, b, a };
+        });
+      },
+      {
+        dataUrl: `data:image/png;base64,${screenshot.toString("base64")}`,
+        samples,
+      },
+    );
+    return pixels;
+  } finally {
+    await browser.close();
+  }
 }
 
 function observeContext(

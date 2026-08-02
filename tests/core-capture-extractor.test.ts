@@ -1234,6 +1234,290 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
     }
   });
 
+  it("keeps the page structural when a nested owner contains a dense clip-path cluster", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          html, body { margin: 0; width: 320px; overflow-x: hidden; }
+          #outside { margin: 24px; }
+          #shell { position: absolute; left: 260px; top: 80px; }
+          #cluster { position: relative; width: 80px; height: 80px; }
+          .tile {
+            position: absolute;
+            top: 0;
+            width: 42px;
+            height: 42px;
+            background: rebeccapurple;
+            clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+          }
+        </style>
+        <p id="outside">This text must remain structural.</p>
+        <div id="shell"><div id="cluster">
+          ${Array.from({ length: 8 }, (_, index) => `<span class="tile" style="left:${index * 28}px"></span>`).join("")}
+        </div></div>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 100 },
+      );
+
+      expect(extraction.root.type).toBe("element");
+      expect(
+        findNode(
+          extraction.root,
+          (node) => node.type === "text" && node.text.includes("must remain structural"),
+        ),
+      ).toBeDefined();
+      expect(findNode(extraction.root, (node) => node.name === "div#cluster")).toMatchObject({
+        type: "image",
+        fallbackLabel: "clipped-subtree",
+        assetMissing: true,
+      });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it("records the browser's legacy rect clip for positioned images", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          html, body { margin: 0; }
+          #legacy {
+            position: absolute;
+            left: 40px;
+            top: 30px;
+            width: 200px;
+            height: 100px;
+            clip: rect(10px, 150px, 80px, 20px);
+          }
+        </style>
+        <img
+          id="legacy"
+          alt="Legacy clipped image"
+          src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='100'%3E%3Crect width='200' height='100' fill='navy'/%3E%3C/svg%3E"
+        />
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 20 },
+      );
+      const image = findNode(extraction.root, (node) => node.name === "img#legacy");
+
+      expect(image).toMatchObject({
+        type: "image",
+        bounds: { x: 40, y: 30, width: 200, height: 100 },
+        clipBounds: { x: 60, y: 40, width: 130, height: 70 },
+      });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it("records positioned-auto descendants in their ancestor paint band", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          html, body { margin: 0; }
+          #stage { position: relative; width: 240px; height: 160px; }
+          #plain { width: 100px; height: 100px; }
+          #floating { position: absolute; left: 40px; top: 30px; width: 120px; height: 80px; }
+          #peer { width: 180px; height: 90px; margin-top: -70px; background: gold; }
+        </style>
+        <div id="stage">
+          <div id="plain">
+            <img id="floating" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='80'%3E%3Crect width='120' height='80' fill='navy'/%3E%3C/svg%3E" />
+          </div>
+          <div id="peer"></div>
+        </div>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 30 },
+      );
+      const stage = findNode(extraction.root, (node) => node.name === "div#stage");
+      const floating = findNode(extraction.root, (node) => node.name === "img#floating");
+      const peer = findNode(extraction.root, (node) => node.name === "div#peer");
+      if (stage === undefined || floating === undefined || peer === undefined) {
+        throw new Error("expected paint-band fixture nodes");
+      }
+      const floatingOrder = floating.ancestorPaintOrders?.find(
+        (fact) => fact.ancestorId === stage.id,
+      )?.order;
+      const peerOrder = peer.ancestorPaintOrders?.find(
+        (fact) => fact.ancestorId === stage.id,
+      )?.order;
+
+      expect(floating.positioned).toBe(true);
+      expect(floating.zIndex).toBeUndefined();
+      expect(floatingOrder).toBeTypeOf("number");
+      expect(peerOrder).toBeTypeOf("number");
+      expect(floatingOrder).toBeGreaterThan(peerOrder ?? Number.POSITIVE_INFINITY);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it("routes browser-resolved counter content through one host screenshot", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          body { counter-reset: step; }
+          #step {
+            counter-increment: step;
+            width: 220px;
+            min-height: 64px;
+            padding: 12px;
+            background: white;
+          }
+          #step::before {
+            content: counter(step, decimal-leading-zero) ". ";
+            font: 700 18px/1 sans-serif;
+          }
+        </style>
+        <article id="step"><span>Keep the generated number visible.</span></article>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 30 },
+      );
+      const step = findNode(extraction.root, (node) => node.name === "article#step");
+
+      expect(step).toMatchObject({
+        type: "image",
+        fallbackLabel: "generated-pseudo",
+        assetMissing: true,
+      });
+      expect(extraction.warnings).toContainEqual(
+        expect.objectContaining({
+          code: "unsupported_paint",
+          nodeId: step?.id,
+        }),
+      );
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it("includes an out-of-box generated pseudo in its screenshot fallback bounds", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          html, body { margin: 0; }
+          body { padding: 40px; counter-reset: item; }
+          #item {
+            counter-increment: item;
+            position: relative;
+            width: 180px;
+            height: 64px;
+            background: white;
+          }
+          #item::before {
+            content: counter(item);
+            position: absolute;
+            left: -24px;
+            top: 8px;
+            width: 16px;
+            height: 20px;
+          }
+        </style>
+        <article id="item">Generated marker</article>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 30 },
+      );
+      const item = findNode(extraction.root, (node) => node.name === "article#item");
+
+      expect(item).toMatchObject({
+        type: "image",
+        fallbackLabel: "generated-pseudo",
+        bounds: { x: 16, y: 40, width: 204, height: 64 },
+      });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it("drops a thin unsupported pseudo mask without flattening editable descendants", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          #card {
+            position: relative;
+            width: 220px;
+            min-height: 64px;
+            padding: 12px;
+            background: white;
+          }
+          #card::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 1px;
+            background: linear-gradient(90deg, #4f46e5, #22c55e);
+            mask-image: linear-gradient(#000, transparent);
+            mask-composite: exclude;
+          }
+        </style>
+        <article id="card"><span id="copy">Keep this text editable.</span></article>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 30 },
+      );
+      const card = findNode(extraction.root, (node) => node.name === "article#card");
+      const copy = findNode(
+        extraction.root,
+        (node) => node.type === "text" && node.text.includes("Keep this text editable."),
+      );
+
+      expect(card?.type).toBe("element");
+      expect(copy?.type).toBe("text");
+      expect(
+        findNode(
+          extraction.root,
+          (node) => node.type === "image" && node.fallbackLabel === "masked-pseudo",
+        ),
+      ).toBe(undefined);
+      expect(extraction.warnings).toContainEqual(
+        expect.objectContaining({
+          code: "unsupported_paint",
+          nodeId: card?.id,
+          detail: expect.stringContaining("thin masked pseudo-element omitted"),
+        }),
+      );
+    } finally {
+      await browser.close();
+    }
+  });
+
 });
 
 function findNode(node: CaptureNode, predicate: (candidate: CaptureNode) => boolean): CaptureNode | undefined {

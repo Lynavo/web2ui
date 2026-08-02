@@ -148,4 +148,30 @@ describe("Figma clipboard payload", () => {
 
     await expect(renderPlanToSvg(plan)).rejects.toThrow("clipboard SVG rejected unsafe markup");
   });
+
+  it("converts Figma's node-to-gradient matrix to the inverse SVG transform", async () => {
+    const plan = makePlan();
+    const first = plan.root.children[0];
+    if (first?.type !== "RECTANGLE") throw new Error("expected rectangle fixture");
+    first.fills = [
+      {
+        type: "GRADIENT_LINEAR",
+        gradientStops: [
+          { position: 0, color: { r: 1, g: 0, b: 0, a: 1 } },
+          { position: 1, color: { r: 0, g: 0, b: 1, a: 1 } },
+        ],
+        gradientTransform: [
+          [2, 0.5, 3],
+          [0.25, 4, 5],
+        ],
+        opacity: 1,
+      },
+    ];
+
+    const svg = await renderPlanToSvg(plan);
+
+    expect(svg).toContain(
+      'x1="0" y1="0.5" x2="1" y2="0.5" gradientTransform="matrix(0.51 -0.03 -0.06 0.25 -1.21 -1.17)"',
+    );
+  });
 });

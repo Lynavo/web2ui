@@ -26,6 +26,7 @@
       }
       h1 { max-width: 720px; margin: 0; font-size: 82px; line-height: .94; letter-spacing: -.06em; }
       .lede { max-width: 560px; font: 22px/1.5 system-ui, sans-serif; }
+      .fixture-image { display: block; width: 48px; height: 48px; image-rendering: pixelated; }
       .poster {
         width: 320px;
         height: 430px;
@@ -72,6 +73,15 @@
         background: #ff5f40;
         -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='currentColor' d='M12 2 15 9l7 .5-5.3 4.6 1.7 7L12 17.3 5.6 21l1.7-7L2 9.5 9 9z'/%3E%3C/svg%3E") center / contain no-repeat;
       }
+      .nested-scroll { width: 240px; max-width: 100%; margin-top: 20px; overflow-x: auto; }
+      .nested-scroll-track { width: 560px; padding: 4px 0; }
+      #scroll-fallback {
+        display: block;
+        width: 180px;
+        height: 48px;
+        margin-left: 180px;
+        border-radius: 8px;
+      }
       .spacer { height: 900px; display: grid; place-items: center; color: #6f7280; font: 16px system-ui, sans-serif; }
       footer { height: 320px; padding: 72px 80px; color: white; background: #172033; }
       footer h2 { margin: 0 0 18px; font-size: 64px; }
@@ -83,13 +93,14 @@
       <div>
         <h1>Local pages, editable ideas.</h1>
         <p class="lede">A deterministic fixture for browser-only capture, conversion, and clipboard rendering.</p>
+        <img class="fixture-image" src="/fixture-image.png" alt="Embedded asset proof" />
         <span class="warning-sample">UI</span>
       </div>
       <div class="poster" aria-label="Abstract poster"></div>
     </header>
     <main>
       <section class="grid">
-        <article class="card missing-asset"><strong>Geometry</strong><p>Measured in the browser, kept as layers.</p><div class="mask"></div></article>
+        <article class="card missing-asset"><strong>Geometry</strong><p>Measured in the browser, kept as layers.</p><div class="mask"></div><div id="nested-scroll" class="nested-scroll"><div class="nested-scroll-track"><canvas id="scroll-fallback" width="180" height="48"></canvas></div></div></article>
         <article class="card rtl"><strong>RTL</strong><p>مرحبا بالعالم — تخطيط قابل للتحرير</p></article>
         <article class="card copy-card"><strong>Editable</strong><p>Page structure, local conversion, editable canvas.</p></article>
       </section>
@@ -100,5 +111,16 @@
       <p>Nothing from this fixture should visit a developer service.</p>
       <span id="private-canary">PRIVATE_CANARY_DO_NOT_TRANSMIT_7F12</span>
     </footer>
+    <script>
+      const nestedScroll = document.querySelector("#nested-scroll");
+      const scrollFallback = document.querySelector("#scroll-fallback");
+      nestedScroll.scrollLeft = 96;
+      const context = scrollFallback.getContext("2d");
+      context.fillStyle = "#ff5f40";
+      context.fillRect(0, 0, 180, 48);
+      context.fillStyle = "#172033";
+      context.font = "700 16px system-ui";
+      context.fillText("SCROLL STATE", 18, 30);
+    </script>
   </body>
 </html>

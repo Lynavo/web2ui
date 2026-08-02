@@ -162,15 +162,19 @@ export class BackgroundController {
       session.attached = true;
 
       const selectedViewport = options.viewports[0] ?? DEFAULT_CAPTURE_OPTIONS.viewports[0]!;
-      if (selectedViewport.source === "preset" && selectedViewport.widthPx !== null) {
-        await this.#platform.sendDebuggerCommand(tab.id, "Emulation.setDeviceMetricsOverride", {
-          width: selectedViewport.widthPx,
-          height: viewport.height,
-          deviceScaleFactor: viewport.deviceScaleFactor,
-          mobile: false,
-        });
-        session.metricsApplied = true;
-      }
+      // Lock the measured browser viewport as well as explicit presets. A
+      // clipped Page.captureScreenshot can otherwise mutate Chromium's layout
+      // viewport between fallback regions and capture pixels after reflow.
+      await this.#platform.sendDebuggerCommand(tab.id, "Emulation.setDeviceMetricsOverride", {
+        width:
+          selectedViewport.source === "preset" && selectedViewport.widthPx !== null
+            ? selectedViewport.widthPx
+            : viewport.width,
+        height: viewport.height,
+        deviceScaleFactor: viewport.deviceScaleFactor,
+        mobile: false,
+      });
+      session.metricsApplied = true;
 
       const selectedTheme = options.themes[0] ?? DEFAULT_CAPTURE_OPTIONS.themes[0]!;
       if (selectedTheme.source === "forced") {

@@ -774,24 +774,24 @@ function convertElement(
   context.inheritedRotationDegrees = previousInheritedRotation;
   return node.clipBounds === undefined
     ? frame
-    : wrapElementInClipBounds(node, frame, parentBounds, context);
+    : wrapNodeInClipBounds(node, frame, parentBounds, context);
 }
 
-function wrapElementInClipBounds(
-  node: CaptureElementNode,
-  frame: RenderPlanFrameNode,
+function wrapNodeInClipBounds(
+  node: CaptureNode,
+  rendered: RenderPlanNode,
   parentBounds: ParentBounds,
   context: ConversionContext,
 ): RenderPlanFrameNode {
   const clipBounds = node.clipBounds;
   if (clipBounds === undefined || clipBounds.width <= 0 || clipBounds.height <= 0) {
-    return frame;
+    throw new Error("measured clip wrapper requires positive clip bounds");
   }
   const clipGeometry = renderGeometryFromBounds(clipBounds, parentBounds, undefined);
-  frame.x = round2(node.bounds.x - clipBounds.x);
-  frame.y = round2(node.bounds.y - clipBounds.y);
-  frame.name = `${node.name} (clipped paint)`;
-  delete frame.sourceNodeId;
+  rendered.x = round2(node.bounds.x - clipBounds.x);
+  rendered.y = round2(node.bounds.y - clipBounds.y);
+  rendered.name = `${node.name} (clipped paint)`;
+  delete rendered.sourceNodeId;
   context.nodeCount += 1;
   return {
     id: nextId(context),
@@ -809,7 +809,7 @@ function wrapElementInClipBounds(
     strokeAlign: "INSIDE",
     effects: [],
     clipsContent: true,
-    children: [frame],
+    children: [rendered],
   };
 }
 
@@ -1609,6 +1609,10 @@ function convertImage(
   context: ConversionContext,
 ): RenderPlanNode {
   context.nodeCount += 1;
+  const withMeasuredClip = (rendered: RenderPlanNode): RenderPlanNode =>
+    node.clipBounds === undefined
+      ? rendered
+      : wrapNodeInClipBounds(node, rendered, parentBounds, context);
   const asset = node.assetId ? context.assetsById.get(node.assetId) : undefined;
   let imageFillAsset = asset;
 
@@ -1616,7 +1620,7 @@ function convertImage(
   // host: emit an explicit labeled placeholder so designers see a clear
   // to-do instead of broken white silhouettes.
   if (node.renderFallback === true && asset === undefined) {
-    return buildRenderFallbackFrame(node, parentBounds, context);
+    return withMeasuredClip(buildRenderFallbackFrame(node, parentBounds, context));
   }
 
   // SVG-backed images become vector nodes so Figma keeps them crisp.
@@ -1634,9 +1638,9 @@ function convertImage(
       context.usedAssetIds.add(asset.assetId);
       const clippedSvg = buildClippedSvgImage(node, parentBounds, context, svgMarkup);
       if (clippedSvg !== null) {
-        return clippedSvg;
+        return withMeasuredClip(clippedSvg);
       }
-      return {
+      return withMeasuredClip({
         id: nextId(context),
         sourceNodeId: node.id,
         type: "SVG",
@@ -1647,7 +1651,7 @@ function convertImage(
         height: Math.max(1, round2(node.bounds.height)),
         opacity: clamp01(node.opacity),
         svgMarkup,
-      };
+      });
     }
   }
 
@@ -1691,7 +1695,7 @@ function convertImage(
       detail: "image placeholder emitted",
     });
   }
-  return rect;
+  return withMeasuredClip(rect);
 }
 
 function buildClippedSvgImage(

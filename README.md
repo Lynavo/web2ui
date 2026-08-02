@@ -86,7 +86,9 @@ feature or reproduce the full semantic model of a native Figma document.
 - **Full Page capture** with bounded scrolling and page-settling behavior.
 - **Viewport presets** for Browser, 1920, 1440, 1024, 768, and 390 pixels.
 - **Theme selection** using the browser preference or forced light/dark emulation.
-- **Local asset recovery** for page-declared images, SVG, fonts, and CSS backgrounds.
+- **Local asset recovery** for page-declared images, SVG, fonts, and CSS backgrounds, including
+  Figma-compatible PNG normalization for browser-decodable formats that are unsafe to paste
+  directly.
 - **Bounded single-frame raster fallbacks** for content that cannot be represented safely as
   editable vectors.
 - **Editable text where possible**, carrying measured geometry, paints, effects, clipping, and
@@ -275,8 +277,11 @@ Canvas, video, WebGL, unsupported SVG, very large assets, browser-only effects, 
 and rapidly changing pages use the `local-static-v1` profile. It takes at most one current-frame
 sample for each attempted fallback region, attempts no more than 12 regions, does not converge
 animation timelines or recover transparent layers from multiple screenshots, and may rasterize,
-approximate, omit, or report the region as a warning. The clipboard output does not preserve native
-components, variables, prototypes, or Auto Layout semantics.
+approximate, omit, or report the region as a warning. Within that fixed limit, image nodes are
+attempted before CSS-background hosts and larger regions are attempted first. Browser-resolved
+generated content such as CSS counters may become a local screenshot, while unsupported 1–2px
+masked decorations may be omitted to keep the host's text and structure editable. The clipboard
+output does not preserve native components, variables, prototypes, or Auto Layout semantics.
 
 ## Troubleshooting
 

@@ -46,17 +46,27 @@ operations, performs conversion, and stores the current result.
 computed paints, text measurements, stacking information, fonts, and asset requests. It is the
 correct place to measure facts that only a browser can know. Later modules should consume those
 facts rather than infer them from class names, URL suffixes, text shape, or layer names.
+This includes legacy rectangular clips, image clip bounds, positioned-auto paint bands, and the
+nearest owner of a dense unsupported clip-path cluster.
 
 Consent-overlay handling, full-page scrolling, asset recovery, and single-frame raster fallbacks
 are coordinated by the extension adapters. Cleanup runs in `finally` paths so capture markers,
 hidden overlays, emulation, debugger attachment, and scroll position are restored on success or
 failure.
+The debugger locks both Browser and preset captures to the viewport measured at capture start;
+this prevents clipped screenshots from changing Chromium's layout width between fallback regions.
 
 The public dynamic-content behavior is `local-static-v1`. It takes at most one current-frame sample
 for each attempted fallback region, attempts no more than 12 regions, and does not finish animation
 timelines, perform multi-frame quality retries, recover transparent layers from a second screenshot,
-or use a hosted rendering environment. Failed or deferred regions become explicit labeled
-placeholders and retain the extractor's node-scoped warning.
+or use a hosted rendering environment. The fixed queue prioritizes image nodes, then CSS-background
+hosts, and uses captured area as the tie-breaker. Failed or deferred image regions become explicit
+labeled placeholders; unresolved background paints remain warning-scoped when their isolated
+single-frame recovery is unavailable. Browser-resolved generated content that cannot be expressed
+as literal text uses one host screenshot whose bounds include measurable pseudo-element paint.
+Unsupported masked pseudo-elements no thicker than 2px are omitted only when they have no filter,
+shadow, or outline that would extend their paint; the omission is warning-scoped and the host tree
+remains editable.
 
 ### Contract module
 
@@ -117,8 +127,20 @@ The content runtime discovers assets declared by the page. The service worker ad
 only HTTP(S) URLs, omits credentials and referrer data, follows bounded time and byte limits, and
 returns bytes to the active capture. Inline SVG is checked before it enters a portable plan.
 These reads may contact the page's own origin or CDN; they never target a Web2UI service.
-If a declared asset is unavailable, conversion keeps the rest of the page usable: image nodes
-receive a neutral placeholder, missing paints are omitted, and the node-scoped warning is retained.
+PNG, JPEG, and GIF can remain direct clipboard assets. WebP, AVIF, tinted rasters, narrowly safe
+styled SVGs, and SVG colors that Figma may not preserve are browser-decoded to PNG under the same
+4 MiB per-asset and approximately 18 MiB total budgets. Required page imagery is admitted before
+optional generated glyphs.
+
+If a declared image is unavailable, it is marked for the bounded screenshot flow instead of being
+silently omitted. An unresolved CSS background is captured in isolation and replaces only the
+host's background fill, leaving its child text and elements editable. Fallbacks are scrolled into
+view and captured with a live page-coordinate clip while Chromium's beyond-viewport screenshot mode
+remains disabled; this avoids that path temporarily reflowing the page. The live box is used when
+its measured dimensions remain stable, while the captured rectangle preserves expanded
+pseudo-element paint. `scrollIntoView` may move nested scrollers, so their authored horizontal
+positions are restored before pixel capture and all ancestor scroll positions are restored during
+cleanup. If recovery still fails, the node-scoped warning is retained.
 
 ### Local persistence
 

@@ -1,5 +1,6 @@
 import type {
   CaptureAsset,
+  CaptureElementNode,
   CaptureImageNode,
   CaptureNode,
   CaptureWarning,
@@ -8,6 +9,7 @@ import type {
 
 export const CAPTURE_MARKER_ATTRIBUTES = [
   "data-h2f-shot",
+  "data-h2f-background-shot",
   "data-h2f-backdrop-source-for",
 ] as const;
 
@@ -16,6 +18,13 @@ export interface ScreenshotFallbackNode {
   rect: PageRect;
   tag: string;
   preserveBackdrop: boolean;
+  kind: "image-node" | "background-host";
+}
+
+export interface AncestorScrollPosition {
+  element: Element;
+  x: number;
+  y: number;
 }
 
 export const LOCAL_STATIC_PROFILE_ID = "local-static-v1";
@@ -23,6 +32,37 @@ export const LOCAL_STATIC_SCREENSHOT_LIMIT = 12;
 
 export function localStaticSettleDelayMs(tag: string): number {
   return tag === "canvas" ? 120 : 60;
+}
+
+export function captureAncestorScrollPositions(target: Element): AncestorScrollPosition[] {
+  const positions: AncestorScrollPosition[] = [];
+  let ancestor = target.parentElement;
+  while (ancestor !== null) {
+    positions.push({
+      element: ancestor,
+      x: ancestor.scrollLeft,
+      y: ancestor.scrollTop,
+    });
+    ancestor = ancestor.parentElement;
+  }
+  return positions;
+}
+
+export function restoreAncestorHorizontalScroll(
+  positions: readonly AncestorScrollPosition[],
+): void {
+  for (const position of positions) {
+    position.element.scrollLeft = position.x;
+  }
+}
+
+export function restoreAncestorScrollPositions(
+  positions: readonly AncestorScrollPosition[],
+): void {
+  for (const position of positions) {
+    position.element.scrollLeft = position.x;
+    position.element.scrollTop = position.y;
+  }
 }
 
 export type ApplyScreenshotFallbackResult =
@@ -46,17 +86,70 @@ export interface LocalStaticFallbackResolution {
   warnings: CaptureWarning[];
 }
 
-export function collectScreenshotFallbackNodes(root: CaptureNode): ScreenshotFallbackNode[] {
+export function planScreenshotFallbackAttempts(
+  requests: readonly ScreenshotFallbackNode[],
+  limit: number,
+): { attempts: ScreenshotFallbackNode[]; deferred: ScreenshotFallbackNode[] } {
+  const ranked = requests
+    .map((request, index) => ({ request, index }))
+    .sort((left, right) => {
+      const kindDifference =
+        Number(left.request.kind === "background-host") -
+        Number(right.request.kind === "background-host");
+      if (kindDifference !== 0) return kindDifference;
+      const areaDifference =
+        right.request.rect.width * right.request.rect.height -
+        left.request.rect.width * left.request.rect.height;
+      return areaDifference || left.index - right.index;
+    })
+    .map(({ request }) => request);
+  const boundedLimit = Math.max(0, Math.floor(limit));
+  return {
+    attempts: ranked.slice(0, boundedLimit),
+    deferred: ranked.slice(boundedLimit),
+  };
+}
+
+export function collectScreenshotFallbackNodes(
+  root: CaptureNode,
+  resolvedAssetIds?: ReadonlySet<string>,
+): ScreenshotFallbackNode[] {
   const nodes: ScreenshotFallbackNode[] = [];
-  walkCaptureNodes(root, (node) => {
-    if (node.type !== "image" || node.assetMissing !== true) return;
-    nodes.push({
-      nodeId: node.id,
-      rect: node.bounds,
-      tag: node.tag,
-      preserveBackdrop: node.fallbackLabel === "backdrop-composite",
-    });
-  });
+  const visit = (node: CaptureNode, isRoot: boolean): void => {
+    if (node.type === "image" && node.assetMissing === true) {
+      nodes.push({
+        nodeId: node.id,
+        rect: node.bounds,
+        tag: node.tag,
+        preserveBackdrop: node.fallbackLabel === "backdrop-composite",
+        kind: "image-node",
+      });
+      return;
+    }
+    if (node.type !== "element") return;
+    const canCaptureBackground =
+      !isRoot &&
+      resolvedAssetIds !== undefined &&
+      node.fills.some(
+        (fill) => fill.type === "image" && !resolvedAssetIds.has(fill.assetId),
+      ) &&
+      node.bounds.width > 0 &&
+      node.bounds.height > 0 &&
+      node.bounds.width <= 4_096 &&
+      node.bounds.height <= 4_096 &&
+      node.bounds.width * node.bounds.height <= 8_000_000;
+    if (canCaptureBackground) {
+      nodes.push({
+        nodeId: node.id,
+        rect: node.bounds,
+        tag: node.tag,
+        preserveBackdrop: false,
+        kind: "background-host",
+      });
+    }
+    for (const child of node.children) visit(child, false);
+  };
+  visit(root, true);
   return nodes;
 }
 
@@ -67,21 +160,26 @@ export async function resolveLocalStaticScreenshotFallbacks(options: {
   maxAssetBytes: number;
   maxTotalAssetBytes: number;
 }): Promise<LocalStaticFallbackResolution> {
-  const requests = collectScreenshotFallbackNodes(options.root);
-  const attempts = requests.slice(0, LOCAL_STATIC_SCREENSHOT_LIMIT);
-  const deferred = requests.slice(LOCAL_STATIC_SCREENSHOT_LIMIT);
+  const resolvedAssetIds = new Set(options.assets.map((asset) => asset.assetId));
+  const requests = collectScreenshotFallbackNodes(options.root, resolvedAssetIds);
+  const { attempts, deferred } = planScreenshotFallbackAttempts(
+    requests,
+    LOCAL_STATIC_SCREENSHOT_LIMIT,
+  );
   const failures: LocalStaticFallbackFailure[] = [];
   let appliedCount = 0;
 
   for (const request of attempts) {
     const dataUrl = await options.capture(request);
     if (dataUrl === null) {
-      markFallbackUnavailable(
-        options.root,
-        request.nodeId,
-        "single-frame capture unavailable",
-        1,
-      );
+      if (request.kind === "image-node") {
+        markFallbackUnavailable(
+          options.root,
+          request.nodeId,
+          "single-frame capture unavailable",
+          1,
+        );
+      }
       failures.push({ nodeId: request.nodeId, reason: "capture-unavailable" });
       continue;
     }
@@ -92,27 +190,32 @@ export async function resolveLocalStaticScreenshotFallbacks(options: {
       dataUrl,
       maxAssetBytes: options.maxAssetBytes,
       maxTotalAssetBytes: options.maxTotalAssetBytes,
+      kind: request.kind,
     });
     if (result.applied) {
       appliedCount += 1;
       continue;
     }
-    markFallbackUnavailable(
-      options.root,
-      request.nodeId,
-      `single-frame capture ${result.reason}`,
-      1,
-    );
+    if (request.kind === "image-node") {
+      markFallbackUnavailable(
+        options.root,
+        request.nodeId,
+        `single-frame capture ${result.reason}`,
+        1,
+      );
+    }
     failures.push({ nodeId: request.nodeId, reason: result.reason });
   }
 
   for (const request of deferred) {
-    markFallbackUnavailable(
-      options.root,
-      request.nodeId,
-      `${LOCAL_STATIC_PROFILE_ID} ${LOCAL_STATIC_SCREENSHOT_LIMIT}-region limit`,
-      0,
-    );
+    if (request.kind === "image-node") {
+      markFallbackUnavailable(
+        options.root,
+        request.nodeId,
+        `${LOCAL_STATIC_PROFILE_ID} ${LOCAL_STATIC_SCREENSHOT_LIMIT}-region limit`,
+        0,
+      );
+    }
     failures.push({ nodeId: request.nodeId, reason: "deferred" });
   }
 
@@ -154,8 +257,13 @@ export function applyScreenshotFallbackAsset(options: {
   dataUrl: string;
   maxAssetBytes: number;
   maxTotalAssetBytes: number;
+  kind?: ScreenshotFallbackNode["kind"];
 }): ApplyScreenshotFallbackResult {
-  const node = findImageNode(options.root, options.nodeId);
+  const kind = options.kind ?? "image-node";
+  const node =
+    kind === "background-host"
+      ? findElementNode(options.root, options.nodeId)
+      : findImageNode(options.root, options.nodeId);
   if (!node) return { applied: false, reason: "node-missing" };
 
   const byteSize = estimateDataUriBytes(options.dataUrl);
@@ -170,20 +278,28 @@ export function applyScreenshotFallbackAsset(options: {
     return { applied: false, reason: "asset-too-large" };
   }
 
-  const assetId = `shot-${options.nodeId}`;
+  const assetId = `${kind === "background-host" ? "shot-background" : "shot"}-${options.nodeId}`;
   options.assets.push({
     assetId,
     kind: "raster-image",
     data: options.dataUrl,
     mediaType: "image/png",
     byteSize,
-    safeSourceLabel: `screenshot-fallback:${node.tag}`,
+    safeSourceLabel:
+      kind === "background-host"
+        ? "screenshot-fallback:background"
+        : `screenshot-fallback:${node.tag}`,
   });
-  node.assetId = assetId;
-  delete node.assetMissing;
-  delete node.renderFallback;
-  delete node.fallbackLabel;
-  node.opacity = 1;
+  if (kind === "background-host") {
+    (node as CaptureElementNode).fills = [{ type: "image", assetId, scaleMode: "fill" }];
+  } else {
+    const imageNode = node as CaptureImageNode;
+    imageNode.assetId = assetId;
+    delete imageNode.assetMissing;
+    delete imageNode.renderFallback;
+    delete imageNode.fallbackLabel;
+    imageNode.opacity = 1;
+  }
   return { applied: true, byteSize, assetId };
 }
 
@@ -217,15 +333,36 @@ export function cleanupCaptureMarkers(root: Document | ShadowRoot = document): v
 export function findCaptureMarker(
   nodeId: string,
   root: Document | ShadowRoot = document,
+  kind: ScreenshotFallbackNode["kind"] = "image-node",
 ): Element | null {
-  const direct = root.querySelector(`[data-h2f-shot="${cssEscape(nodeId)}"]`);
+  const attribute = kind === "background-host" ? "data-h2f-background-shot" : "data-h2f-shot";
+  const direct = root.querySelector(`[${attribute}="${cssEscape(nodeId)}"]`);
   if (direct) return direct;
   for (const element of root.querySelectorAll("*")) {
     if (!element.shadowRoot) continue;
-    const nested = findCaptureMarker(nodeId, element.shadowRoot);
+    const nested = findCaptureMarker(nodeId, element.shadowRoot, kind);
     if (nested) return nested;
   }
   return null;
+}
+
+export function screenshotFallbackPageClip(
+  capturedRect: PageRect,
+  liveViewportRect: PageRect,
+  scroll: { x: number; y: number },
+): PageRect | null {
+  const livePageRect = {
+    x: liveViewportRect.x + scroll.x,
+    y: liveViewportRect.y + scroll.y,
+    width: liveViewportRect.width,
+    height: liveViewportRect.height,
+  };
+  const dimensionsMatch =
+    Math.abs(capturedRect.width - livePageRect.width) <= 1 &&
+    Math.abs(capturedRect.height - livePageRect.height) <= 1;
+  if (dimensionsMatch && isValidScreenshotRect(livePageRect)) return livePageRect;
+  if (isValidScreenshotRect(capturedRect)) return { ...capturedRect };
+  return isValidScreenshotRect(livePageRect) ? livePageRect : null;
 }
 
 export function estimateDataUriBytes(data: string): number {
@@ -259,8 +396,29 @@ function findImageNode(root: CaptureNode, nodeId: string): CaptureImageNode | nu
   return found;
 }
 
+function findElementNode(root: CaptureNode, nodeId: string): CaptureElementNode | null {
+  let found: CaptureElementNode | null = null;
+  walkCaptureNodes(root, (node) => {
+    if (!found && node.type === "element" && node.id === nodeId) found = node;
+  });
+  return found;
+}
+
 function cssEscape(value: string): string {
   return globalThis.CSS?.escape
     ? globalThis.CSS.escape(value)
     : value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function isValidScreenshotRect(rect: PageRect): boolean {
+  return (
+    Number.isFinite(rect.x) &&
+    Number.isFinite(rect.y) &&
+    Number.isFinite(rect.width) &&
+    Number.isFinite(rect.height) &&
+    rect.x >= 0 &&
+    rect.y >= 0 &&
+    rect.width >= 1 &&
+    rect.height >= 1
+  );
 }

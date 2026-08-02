@@ -10,6 +10,7 @@ import type {
   CaptureWarning,
 } from "../core/contracts/capture.js";
 import { CAPTURE_CONTRACT_VERSION } from "../core/contracts/capture.js";
+import { markUnresolvedImageNodes } from "./content-assets.js";
 import type { RunCaptureCommand } from "./types.js";
 
 const MAX_CAPTURE_NODES = 8_000;
@@ -81,6 +82,7 @@ export async function executeContentCapture(
     dependencies.assertActive(command);
     const resolved = await dependencies.resolveAssets(extraction, command);
     dependencies.assertActive(command);
+    markUnresolvedImageNodes(extraction.root, resolved.assets);
 
     const warnings: CaptureWarning[] = [
       ...extraction.warnings,

@@ -4,6 +4,25 @@ All user-visible changes to Web2UI — Copy for Figma are recorded here.
 
 ## Unreleased
 
+## 0.1.3 — 2026-08-02
+
+- Recovered failed image and CSS-background assets with bounded, single-frame screenshots while
+  preserving editable child layers; fallback slots now prioritize image nodes and larger regions.
+- Normalized WebP, AVIF, safely styled SVG, modern-color SVG, and tinted raster assets to
+  Figma-compatible PNG data before clipboard export, without increasing the public asset budget.
+- Reserved the local asset budget for page imagery before optional generated glyphs and fixed
+  transformed linear, radial, and angular gradients in the clipboard SVG.
+- Added real Manifest V3 regression coverage that verifies page images and fallback screenshots
+  remain embedded exactly once and never become external clipboard references.
+- Preserved browser-measured legacy and image clipping, nested clip-path ownership, and
+  positioned-auto paint order instead of flattening a larger page shell.
+- Added bounded screenshot recovery for browser-resolved generated content such as CSS counters,
+  including pseudo-element paint outside the host box. Thin unsupported masked decorations may be
+  omitted with a scoped warning so their editable host content remains intact.
+- Locked the measured capture viewport and preserved authored horizontal scroll positions while
+  capturing nested fallback regions, preventing fallback pixels from being shifted by reflow or
+  contaminated by neighboring content.
+
 ## 0.1.2 — 2026-07-24
 
 - Moved the public source, issue, security, and release links to `Lynavo/web2ui` after the

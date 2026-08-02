@@ -6,10 +6,128 @@ import {
   type CaptureWarningCode,
   type Paint,
 } from "../core/contracts/capture.js";
-import type { InPageAssetRequest } from "../core/capture/in-page-extractor.js";
+import type {
+  InPageInlineAsset,
+} from "../core/capture/in-page-extractor.js";
 
 export const MAX_ASSET_BYTES = 4 * 1024 * 1024;
 export const MAX_TOTAL_ASSET_BYTES = 18 * 1024 * 1024;
+
+export interface CaptureAssetCandidate {
+  assetId: string;
+  sourceKind: "svg-image" | "svg-inline" | "raster-image";
+  bytes: Uint8Array;
+  mediaType: string;
+  tint?: string;
+  naturalWidth?: number;
+  naturalHeight?: number;
+}
+
+export interface RasterizedCaptureAsset {
+  dataUrl: string;
+  byteSize: number;
+  naturalWidth?: number;
+  naturalHeight?: number;
+}
+
+export type CaptureAssetRasterizer = (input: {
+  bytes: Uint8Array;
+  mediaType: string;
+  tint?: string;
+}) => Promise<RasterizedCaptureAsset | null>;
+
+const DIRECT_CLIPBOARD_RASTER_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+]);
+
+export async function normalizeCaptureAsset(
+  candidate: CaptureAssetCandidate,
+  rasterize?: CaptureAssetRasterizer,
+): Promise<CaptureAsset | null> {
+  if (candidate.bytes.byteLength <= 0 || candidate.bytes.byteLength > MAX_ASSET_BYTES) {
+    return null;
+  }
+  const factualMediaType = normalizeMediaType(candidate.mediaType);
+  const mediaType = factualMediaType
+    ? factualMediaType
+    : candidate.sourceKind === "svg-image" || candidate.sourceKind === "svg-inline"
+      ? "image/svg+xml"
+      : "";
+
+  if (mediaType === "image/svg+xml") {
+    const source = new TextDecoder().decode(candidate.bytes);
+    if (isSafeSvgMarkup(source)) {
+      if (usesModernSvgColorFunction(source)) {
+        return rasterizeCaptureAsset(candidate, mediaType, rasterize);
+      }
+      const data = candidate.tint === undefined ? source : tintSvgMarkup(source, candidate.tint);
+      if (data === null || !isSafeSvgMarkup(data)) return null;
+      const byteSize = new TextEncoder().encode(data).byteLength;
+      if (byteSize > MAX_ASSET_BYTES) return null;
+      return {
+        assetId: candidate.assetId,
+        kind: candidate.sourceKind === "svg-inline" ? "svg-inline" : "svg-image",
+        data,
+        mediaType,
+        byteSize,
+        ...(candidate.naturalWidth === undefined
+          ? {}
+          : { naturalWidth: candidate.naturalWidth }),
+        ...(candidate.naturalHeight === undefined
+          ? {}
+          : { naturalHeight: candidate.naturalHeight }),
+      };
+    }
+    if (!isSafeStaticStyledSvg(source)) return null;
+    return rasterizeCaptureAsset(candidate, mediaType, rasterize);
+  }
+
+  if (!mediaType.startsWith("image/")) return null;
+  if (!DIRECT_CLIPBOARD_RASTER_TYPES.has(mediaType) || candidate.tint !== undefined) {
+    return rasterizeCaptureAsset(candidate, mediaType, rasterize);
+  }
+  return {
+    assetId: candidate.assetId,
+    kind: "raster-image",
+    data: `data:${mediaType};base64,${bytesToBase64(candidate.bytes)}`,
+    mediaType,
+    byteSize: candidate.bytes.byteLength,
+    ...(candidate.naturalWidth === undefined ? {} : { naturalWidth: candidate.naturalWidth }),
+    ...(candidate.naturalHeight === undefined ? {} : { naturalHeight: candidate.naturalHeight }),
+  };
+}
+
+export function partitionCaptureInlineAssets(
+  assets: readonly InPageInlineAsset[],
+): { primary: InPageInlineAsset[]; deferred: InPageInlineAsset[] } {
+  const primary: InPageInlineAsset[] = [];
+  const deferred: InPageInlineAsset[] = [];
+  for (const asset of assets) {
+    (asset.deferred === true ? deferred : primary).push(asset);
+  }
+  return { primary, deferred };
+}
+
+export function markUnresolvedImageNodes(
+  root: CaptureNode,
+  assets: readonly CaptureAsset[],
+): void {
+  const resolvedAssetIds = new Set(assets.map((asset) => asset.assetId));
+  const visit = (node: CaptureNode): void => {
+    if (
+      node.type === "image" &&
+      node.assetId !== undefined &&
+      !resolvedAssetIds.has(node.assetId)
+    ) {
+      node.assetMissing = true;
+    }
+    if (node.type !== "element") return;
+    for (const child of node.children) visit(child);
+  };
+  visit(root);
+}
 
 export function collectAssetNodeIds(root: CaptureNode): Map<string, Set<string>> {
   const nodeIdsByAsset = new Map<string, Set<string>>();
@@ -56,44 +174,6 @@ export function buildAssetWarnings(
   }));
 }
 
-export function buildResolvedCaptureAsset(
-  request: InPageAssetRequest,
-  bytes: Uint8Array,
-  responseContentType: string,
-): CaptureAsset | null {
-  if (bytes.byteLength > MAX_ASSET_BYTES) return null;
-
-  const factualMediaType = normalizeMediaType(responseContentType);
-  const isSvg = factualMediaType
-    ? factualMediaType === "image/svg+xml"
-    : request.kind === "svg-image";
-
-  if (isSvg) {
-    const source = new TextDecoder().decode(bytes);
-    if (!isSafeSvgMarkup(source)) return null;
-    const data = request.tint === undefined ? source : tintSvgMarkup(source, request.tint);
-    if (data === null || !isSafeSvgMarkup(data)) return null;
-    const byteSize = new TextEncoder().encode(data).byteLength;
-    if (byteSize > MAX_ASSET_BYTES) return null;
-    return {
-      assetId: request.assetId,
-      kind: "svg-image",
-      data,
-      mediaType: "image/svg+xml",
-      byteSize,
-    };
-  }
-
-  if (!factualMediaType.startsWith("image/")) return null;
-  return {
-    assetId: request.assetId,
-    kind: "raster-image",
-    data: `data:${factualMediaType};base64,${bytesToBase64(bytes)}`,
-    mediaType: factualMediaType,
-    byteSize: bytes.byteLength,
-  };
-}
-
 export function tintSvgMarkup(svg: string, tint: string): string | null {
   if (!isSafeSvgMarkup(svg) || !isSafeTint(tint)) return null;
   let tinted = svg
@@ -108,6 +188,119 @@ export function tintSvgMarkup(svg: string, tint: string): string | null {
 
 export function normalizeMediaType(value: string): string {
   return value.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+}
+
+function usesModernSvgColorFunction(source: string): boolean {
+  return /(?:^|[^\w-])(?:oklch|oklab|lch|lab|color)\s*\(/iu.test(source);
+}
+
+function isSafeStaticStyledSvg(source: string): boolean {
+  const styles: string[] = [];
+  const withoutStyles = source.replace(
+    /<style(?:\s+type=(?:"text\/css"|'text\/css'))?\s*>([\s\S]*?)<\/style\s*>/giu,
+    (_match, css: string) => {
+      styles.push(css);
+      return "";
+    },
+  );
+  return (
+    styles.length > 0 &&
+    !/<\/?style\b/iu.test(withoutStyles) &&
+    isSafeSvgMarkup(withoutStyles) &&
+    styles.every(isSafeStaticSvgCss)
+  );
+}
+
+function isSafeStaticSvgCss(source: string): boolean {
+  if (
+    source.length > 64_000 ||
+    /(?:@|url\s*\(|expression\s*\(|var\s*\(|env\s*\(|attr\s*\(|javascript:|behavior\s*:|-moz-binding|\\)/iu.test(
+      source,
+    )
+  ) {
+    return false;
+  }
+  const css = source.replace(/\/\*[\s\S]*?\*\//gu, "").trim();
+  const rules = Array.from(css.matchAll(/([^{}]+)\{([^{}]*)\}/gu));
+  if (rules.length === 0 || css.replace(/([^{}]+)\{([^{}]*)\}/gu, "").trim() !== "") {
+    return false;
+  }
+  const allowedProperties = new Set([
+    "color",
+    "display",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "opacity",
+    "stop-color",
+    "stop-opacity",
+    "stroke",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "stroke-opacity",
+    "stroke-width",
+    "visibility",
+  ]);
+  return rules.every((rule) => {
+    const selector = rule[1]?.trim() ?? "";
+    const declarations = rule[2]?.trim() ?? "";
+    if (!/^[.#]?[a-z_][\w-]*(?:\s*,\s*[.#]?[a-z_][\w-]*)*$/iu.test(selector)) {
+      return false;
+    }
+    return declarations
+      .split(";")
+      .map((declaration) => declaration.trim())
+      .filter(Boolean)
+      .every((declaration) => {
+        const separator = declaration.indexOf(":");
+        if (separator <= 0) return false;
+        const property = declaration.slice(0, separator).trim().toLowerCase();
+        const value = declaration.slice(separator + 1).trim();
+        return (
+          allowedProperties.has(property) &&
+          value.length > 0 &&
+          value.length <= 256 &&
+          !/[<>{};@\\]/u.test(value)
+        );
+      });
+  });
+}
+
+async function rasterizeCaptureAsset(
+  candidate: CaptureAssetCandidate,
+  mediaType: string,
+  rasterize: CaptureAssetRasterizer | undefined,
+): Promise<CaptureAsset | null> {
+  if (rasterize === undefined) return null;
+  const result = await rasterize({
+    bytes: candidate.bytes,
+    mediaType,
+    ...(candidate.tint === undefined ? {} : { tint: candidate.tint }),
+  });
+  if (
+    result === null ||
+    result.byteSize <= 0 ||
+    result.byteSize > MAX_ASSET_BYTES ||
+    !result.dataUrl.startsWith("data:image/png;base64,")
+  ) {
+    return null;
+  }
+  return {
+    assetId: candidate.assetId,
+    kind: "raster-image",
+    data: result.dataUrl,
+    mediaType: "image/png",
+    byteSize: result.byteSize,
+    ...((result.naturalWidth ?? candidate.naturalWidth) === undefined
+      ? {}
+      : { naturalWidth: result.naturalWidth ?? candidate.naturalWidth }),
+    ...((result.naturalHeight ?? candidate.naturalHeight) === undefined
+      ? {}
+      : { naturalHeight: result.naturalHeight ?? candidate.naturalHeight }),
+  };
 }
 
 function isSafeTint(value: string): boolean {
