@@ -4,6 +4,16 @@ All user-visible changes to Web2UI — Copy for Figma are recorded here.
 
 ## Unreleased
 
+## 0.1.4 — 2026-08-03
+
+- Preserved fully transparent computed text instead of repainting accessibility labels as black.
+- Kept an element's own CSS filter when recovering an unavailable background, so authored
+  dark-mode inversion and brightness effects remain visible.
+- Captured non-backdrop single-frame fallback regions against transparent ancestor and browser
+  backgrounds, preventing page colors from being baked into otherwise transparent local assets.
+- Anchored every Clipboard SVG text line to an absolute baseline, preventing Figma from shifting
+  multiline labels that contain mixed inline styles.
+
 ## 0.1.3 — 2026-08-02
 
 - Recovered failed image and CSS-background assets with bounded, single-frame screenshots while

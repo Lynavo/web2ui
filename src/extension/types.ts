@@ -41,7 +41,11 @@ export type ContentMessage = CaptureRunIdentity &
     | { type: "capture-progress"; progress: number; label: string }
     | { type: "capture-done"; document: CaptureDocument }
     | { type: "capture-error"; code: string }
-    | { type: "capture-element-screenshot"; rect: PageRect }
+    | {
+        type: "capture-element-screenshot";
+        rect: PageRect;
+        transparentBackground?: boolean;
+      }
     | { type: "fetch-asset"; url: string }
   );
 

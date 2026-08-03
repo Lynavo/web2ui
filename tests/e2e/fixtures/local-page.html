@@ -82,6 +82,30 @@
         margin-left: 180px;
         border-radius: 8px;
       }
+      .fallback-proof-row {
+        display: flex;
+        gap: 32px;
+        margin-top: 48px;
+      }
+      .alpha-fallback-proof {
+        position: relative;
+        width: 120px;
+        height: 72px;
+        background: #3155ff;
+      }
+      #alpha-fallback-canvas {
+        position: absolute;
+        inset: 0;
+        width: 120px;
+        height: 72px;
+      }
+      .filtered-background-proof {
+        width: 120px;
+        height: 72px;
+        background-color: white;
+        background-image: url("/unavailable-filter-asset.png");
+        filter: invert(1);
+      }
       .spacer { height: 900px; display: grid; place-items: center; color: #6f7280; font: 16px system-ui, sans-serif; }
       footer { height: 320px; padding: 72px 80px; color: white; background: #172033; }
       footer h2 { margin: 0 0 18px; font-size: 64px; }
@@ -104,6 +128,12 @@
         <article class="card rtl"><strong>RTL</strong><p>مرحبا بالعالم — تخطيط قابل للتحرير</p></article>
         <article class="card copy-card"><strong>Editable</strong><p>Page structure, local conversion, editable canvas.</p></article>
       </section>
+      <div class="fallback-proof-row" aria-hidden="true">
+        <div class="alpha-fallback-proof">
+          <canvas id="alpha-fallback-canvas" width="120" height="72"></canvas>
+        </div>
+        <div id="filtered-background-proof" class="filtered-background-proof"></div>
+      </div>
       <div class="spacer">Scroll depth / lazy content boundary</div>
     </main>
     <footer>
@@ -121,6 +151,16 @@
       context.fillStyle = "#172033";
       context.font = "700 16px system-ui";
       context.fillText("SCROLL STATE", 18, 30);
+
+      const alphaFallbackCanvas = document.querySelector("#alpha-fallback-canvas");
+      const alphaFallbackContext = alphaFallbackCanvas.getContext("2d");
+      alphaFallbackContext.fillStyle = "#ff5f40";
+      alphaFallbackContext.beginPath();
+      alphaFallbackContext.arc(60, 36, 22, 0, Math.PI * 2);
+      alphaFallbackContext.fill();
+      Object.defineProperty(alphaFallbackCanvas, "toDataURL", {
+        value() { throw new Error("synthetic canvas readback failure"); },
+      });
     </script>
   </body>
 </html>

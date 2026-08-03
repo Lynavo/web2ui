@@ -194,8 +194,10 @@ function renderText(node: RenderPlanTextNode, context: SvgContext): string {
     .map((line, index) => {
       const lineStart = globalOffset;
       globalOffset += line.length + (index < lines.length - 1 ? 1 : 0);
-      const dy = index === 0 ? node.fontSizePx : node.lineHeightPx;
-      return `<tspan x="${num(x)}" dy="${num(dy)}">${renderTextLineSegments(
+      // Keep each line independent: Figma can accumulate relative tspan
+      // offsets differently once a line contains nested style spans.
+      const baselineY = node.fontSizePx + index * node.lineHeightPx;
+      return `<tspan x="${num(x)}" y="${num(baselineY)}">${renderTextLineSegments(
         node,
         line,
         lineStart,

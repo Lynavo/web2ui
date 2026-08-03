@@ -154,6 +154,24 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
       await target.bringToFront();
       expect(await target.evaluate(() => window.innerWidth)).toBe(1280);
       await target.screenshot({ path: path.join(artifacts, "full-page-source.png"), fullPage: true });
+      const filteredBackgroundPoint = await target.locator("#filtered-background-proof").evaluate(
+        (element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            x: Math.round(rect.left + window.scrollX + 10),
+            y: Math.round(rect.top + window.scrollY + 10),
+          };
+        },
+      );
+      const transparentFallbackPoint = await target.locator("#alpha-fallback-canvas").evaluate(
+        (element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            x: Math.round(rect.left + window.scrollX + 5),
+            y: Math.round(rect.top + window.scrollY + 5),
+          };
+        },
+      );
       expect(await target.locator("#nested-scroll").evaluate((element) => element.scrollLeft)).toBe(96);
       await clickInInactivePopup(popup, "Capture full page");
       await waitForReadyState(popup, 30_000, consoleMessages);
@@ -165,26 +183,46 @@ describe.sequential("real MV3 local Copy for Figma flow", () => {
       const fullPayload = await requestClipboardPayload(popup);
       await writeFile(path.join(artifacts, "full-page-clipboard.svg"), fullPayload.svg);
       const fullSize = svgSize(fullPayload.svg);
-      const fullAssetIds = await requestStoredPlanAssetIds(popup);
+      const storedPlanEvidence = await requestStoredPlanEvidence(
+        popup,
+        "canvas#alpha-fallback-canvas",
+      );
       expect(fullSize.width).toBe(1280);
       expect(fullSize.height).toBeGreaterThan(2_000);
-      expect(fullAssetIds.some((assetId) => assetId.startsWith("shot-background-"))).toBe(true);
+      expect(
+        storedPlanEvidence.assetIds.some((assetId) => assetId.startsWith("shot-background-")),
+      ).toBe(true);
       expect(fullPayload.svg).toContain("Full-page end marker.");
       expect(countOccurrences(fullPayload.svg, "Full-page end marker.")).toBe(1);
       expect(countOccurrences(fullPayload.svg, fixturePngDataUrl)).toBe(1);
       expect(fullPayload.svg.match(/<image\b/gu)?.length ?? 0).toBeGreaterThanOrEqual(2);
       expect(fullPayload.svg).not.toMatch(/<image\b[^>]*\bhref="https?:/iu);
+      const alphaFallbackPixels = await sampleImagePixels(popup, storedPlanEvidence.nodeAssetUrl, [
+        { x: 5, y: 5 },
+        { x: 60, y: 36 },
+      ]);
+      expect(alphaFallbackPixels[0]?.a).toBe(0);
+      expect(alphaFallbackPixels[1]).toEqual({ r: 255, g: 95, b: 64, a: 255 });
       const fullPreviewPixels = await screenshotClipboardPreview(
         fullPayload.html,
         path.join(artifacts, "full-page-clipboard-preview.png"),
         [
           { x: 215, y: 1036 },
           { x: 420, y: 850 },
+          filteredBackgroundPoint,
+          transparentFallbackPoint,
+          {
+            x: transparentFallbackPoint.x + 55,
+            y: transparentFallbackPoint.y + 31,
+          },
         ],
       );
       expect(fullPreviewPixels, consoleMessages.join("\n")).toEqual([
         { r: 23, g: 32, b: 51, a: 255 },
         { r: 255, g: 255, b: 255, a: 255 },
+        { r: 0, g: 0, b: 0, a: 255 },
+        { r: 49, g: 85, b: 255, a: 255 },
+        { r: 255, g: 95, b: 64, a: 255 },
       ]);
 
       await popup.close();
@@ -260,8 +298,11 @@ async function requestClipboardPayload(popup: Page): Promise<{ svg: string; html
   });
 }
 
-async function requestStoredPlanAssetIds(popup: Page): Promise<string[]> {
-  return popup.evaluate(async () => {
+async function requestStoredPlanEvidence(
+  popup: Page,
+  nodeName: string,
+): Promise<{ assetIds: string[]; nodeAssetUrl: string }> {
+  return popup.evaluate(async (requestedName) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("web2ui-extension", 1);
       request.onsuccess = () => resolve(request.result);
@@ -274,15 +315,48 @@ async function requestStoredPlanAssetIds(popup: Page): Promise<string[]> {
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error ?? new Error("test plan read failed"));
       });
-      if (typeof record !== "object" || record === null || !("plan" in record)) return [];
-      const plan = record.plan as { assets?: Array<{ assetId?: unknown }> };
-      return (plan.assets ?? [])
+      if (typeof record !== "object" || record === null || !("plan" in record)) {
+        throw new Error("stored plan unavailable");
+      }
+      const plan = record.plan as {
+        root?: unknown;
+        assets?: Array<{
+          assetId?: unknown;
+          ref?: { kind?: unknown; url?: unknown };
+        }>;
+      };
+      const assetIds = (plan.assets ?? [])
         .map((asset) => asset.assetId)
         .filter((assetId): assetId is string => typeof assetId === "string");
+      const visit = (value: unknown): string | null => {
+        if (typeof value !== "object" || value === null) return null;
+        const node = value as {
+          name?: unknown;
+          fills?: Array<{ type?: unknown; assetId?: unknown }>;
+          children?: unknown[];
+        };
+        if (node.name === requestedName) {
+          const fill = node.fills?.find(
+            (candidate) => candidate.type === "IMAGE" && typeof candidate.assetId === "string",
+          );
+          return typeof fill?.assetId === "string" ? fill.assetId : null;
+        }
+        for (const child of node.children ?? []) {
+          const assetId = visit(child);
+          if (assetId !== null) return assetId;
+        }
+        return null;
+      };
+      const assetId = visit(plan.root);
+      const asset = plan.assets?.find((candidate) => candidate.assetId === assetId);
+      if (asset?.ref?.kind !== "url" || typeof asset.ref.url !== "string") {
+        throw new Error(`portable asset unavailable for ${requestedName}`);
+      }
+      return { assetIds, nodeAssetUrl: asset.ref.url };
     } finally {
       database.close();
     }
-  });
+  }, nodeName);
 }
 
 async function waitForReadyState(
@@ -363,6 +437,31 @@ async function screenshotClipboardPreview(
   } finally {
     await browser.close();
   }
+}
+
+async function sampleImagePixels(
+  page: Page,
+  dataUrl: string,
+  samples: ReadonlyArray<{ x: number; y: number }>,
+): Promise<Array<{ r: number; g: number; b: number; a: number }>> {
+  return page.evaluate(
+    async ({ imageUrl, requestedSamples }) => {
+      const image = new Image();
+      image.src = imageUrl;
+      await image.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d");
+      if (context === null) throw new Error("asset pixel canvas unavailable");
+      context.drawImage(image, 0, 0);
+      return requestedSamples.map(({ x, y }) => {
+        const [r = 0, g = 0, b = 0, a = 0] = context.getImageData(x, y, 1, 1).data;
+        return { r, g, b, a };
+      });
+    },
+    { imageUrl: dataUrl, requestedSamples: samples },
+  );
 }
 
 function observeContext(

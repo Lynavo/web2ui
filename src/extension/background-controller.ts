@@ -62,6 +62,7 @@ export interface BackgroundPlatform {
       | "Emulation.setDeviceMetricsOverride"
       | "Emulation.clearDeviceMetricsOverride"
       | "Emulation.setEmulatedMedia"
+      | "Emulation.setDefaultBackgroundColorOverride"
       | "Page.captureScreenshot",
     parameters: Record<string, unknown>,
   ): Promise<unknown>;

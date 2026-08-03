@@ -75,10 +75,11 @@ The test verifies both capture modes, popup behavior, viewport/theme choices, cl
 preparation, result survival across a service-worker restart, and absence of capture data sent to
 a Web2UI host. It also checks the raw clipboard SVG for exactly-once inline page assets, a recovered
 CSS-background screenshot, the preservation of a nested horizontal scroller during a canvas
-fallback, fixed pixel canaries for the canvas frame and isolated background, and the absence of
-external image references. Clipboard previews render in an independent clean browser so transient
-debugger viewport emulation cannot corrupt the evidence. The browser profile and screenshots are
-disposable and must not be committed.
+fallback, transparent pixels in an isolated single-frame asset, filtered background recovery,
+fixed pixel canaries for the canvas frame and isolated backgrounds, and the absence of external
+image references. Clipboard previews render in an independent clean browser so transient debugger
+viewport emulation cannot corrupt the evidence. The browser profile and screenshots are disposable
+and must not be committed.
 
 ## Writing reliable tests
 

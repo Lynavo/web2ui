@@ -1,6 +1,6 @@
 {
   "name": "web2ui-extension",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Local-only Chrome extension that captures web pages and copies them for Figma.",
   "license": "AGPL-3.0-only",

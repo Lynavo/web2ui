@@ -283,6 +283,49 @@ break\" width=\"20\" height=\"20\"%3E%3Cpath d=\"M0 0h20v20H0z\"/%3E%3C/svg%3E')
     }
   });
 
+  it("preserves fully transparent computed text instead of repainting it black", async () => {
+    const browser = await chromium.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 320, height: 200 } });
+      await page.setContent(`
+        <!doctype html>
+        <style>
+          body { margin: 0; }
+          #badge {
+            width: 180px;
+            height: 48px;
+            color: rgba(17, 34, 51, 0);
+            background: rgb(20, 24, 32);
+          }
+        </style>
+        <div id="badge">Accessible store badge</div>
+      `);
+
+      const extraction = await page.evaluate<InPageExtractionResult, { maxNodes: number }>(
+        extractCaptureInPage,
+        { maxNodes: 20 },
+      );
+      const label = findNode(
+        extraction.root,
+        (node) => node.type === "text" && node.text === "Accessible store badge",
+      );
+
+      expect(label).toMatchObject({
+        type: "text",
+        style: {
+          color: {
+            r: 17 / 255,
+            g: 34 / 255,
+            b: 51 / 255,
+            a: 0,
+          },
+        },
+      });
+    } finally {
+      await browser.close();
+    }
+  });
+
   it("measures text pseudo glyphs without overlapping the element text", async () => {
     const browser = await chromium.launch();
     try {

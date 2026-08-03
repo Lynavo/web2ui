@@ -140,7 +140,10 @@ remains disabled; this avoids that path temporarily reflowing the page. The live
 its measured dimensions remain stable, while the captured rectangle preserves expanded
 pseudo-element paint. `scrollIntoView` may move nested scrollers, so their authored horizontal
 positions are restored before pixel capture and all ancestor scroll positions are restored during
-cleanup. If recovery still fails, the node-scoped warning is retained.
+cleanup. Non-backdrop fallbacks temporarily clear ancestor page backgrounds and use Chromium's
+transparent default canvas during the same single screenshot, so transparent pixels do not bake in
+unrelated page color. Background-host isolation preserves the host's own CSS filter while disabling
+backdrop sampling and blend modes. If recovery still fails, the node-scoped warning is retained.
 
 ### Local persistence
 

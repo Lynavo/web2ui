@@ -353,10 +353,6 @@ export async function extractCaptureInPage(
     return result;
   }
 
-  function parseColorOpaque(input: string | null | undefined): RgbaColor {
-    return parseColor(input) ?? { r: 0, g: 0, b: 0, a: 1 };
-  }
-
   function parsePx(input: string | null | undefined): number {
     if (!input) {
       return 0;
@@ -1885,7 +1881,7 @@ export async function extractCaptureInPage(
       italic: style.fontStyle === "italic" || style.fontStyle.startsWith("oblique"),
       lineHeightPx,
       letterSpacingPx: letterSpacing,
-      color: parseColorOpaque(style.color),
+      color: parseColor(style.color, true) ?? { r: 0, g: 0, b: 0, a: 1 },
       // start/end are logical values and require the measured direction fact
       // (start means right in RTL). Explicit left/right/center/justify values
       // are physical and independent of direction.

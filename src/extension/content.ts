@@ -360,17 +360,25 @@ async function captureScreenshotFallback(
     const restoreOverlaps = request.preserveBackdrop
       ? () => undefined
       : hideOverlappingElements(element);
+    const restoreAncestorBackgrounds = request.preserveBackdrop
+      ? () => undefined
+      : isolateAncestorBackgrounds(element);
     const restoreBackgroundIsolation =
       request.kind === "background-host"
         ? isolateElementBackground(element)
         : () => undefined;
     try {
-      return await captureElementRect(clip, command);
+      await nextAnimationFrame();
+      return await captureElementRect(clip, command, !request.preserveBackdrop);
     } finally {
       try {
         restoreBackgroundIsolation();
       } finally {
-        restoreOverlaps();
+        try {
+          restoreAncestorBackgrounds();
+        } finally {
+          restoreOverlaps();
+        }
       }
     }
   } finally {
@@ -381,12 +389,30 @@ async function captureScreenshotFallback(
 async function captureElementRect(
   rect: PageRect,
   command: RunCaptureCommand,
+  transparentBackground = false,
 ): Promise<string | null> {
   const response = await sendForRun<ElementScreenshotResponse>(command, {
     type: "capture-element-screenshot",
     rect,
+    ...(transparentBackground ? { transparentBackground: true } : {}),
   });
   return response.ok ? response.dataUrl ?? null : null;
+}
+
+function isolateAncestorBackgrounds(element: HTMLElement): () => void {
+  const ancestors: Array<{ element: HTMLElement; style: string | null }> = [];
+  for (let current = element.parentElement; current !== null; current = current.parentElement) {
+    if (!(current instanceof HTMLElement)) continue;
+    ancestors.push({ element: current, style: current.getAttribute("style") });
+    current.style.setProperty("background", "transparent", "important");
+  }
+
+  return () => {
+    for (const { element: ancestor, style } of ancestors) {
+      if (style === null) ancestor.removeAttribute("style");
+      else ancestor.setAttribute("style", style);
+    }
+  };
 }
 
 function hideOverlappingElements(target: HTMLElement): () => void {
@@ -438,7 +464,9 @@ function isolateElementBackground(element: HTMLElement): () => void {
   element.style.setProperty("border-image-source", "none", "important");
   element.style.setProperty("box-shadow", "none", "important");
   element.style.setProperty("outline", "none", "important");
-  element.style.setProperty("filter", "none", "important");
+  // The host filter changes its own background pixels and must remain part of
+  // an isolated background capture. Backdrop filters and blend modes still
+  // need neutralizing because they depend on paint outside this host layer.
   element.style.setProperty("backdrop-filter", "none", "important");
   element.style.setProperty("mix-blend-mode", "normal", "important");
   element.style.setProperty("opacity", "1", "important");

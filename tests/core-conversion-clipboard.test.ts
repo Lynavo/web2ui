@@ -127,6 +127,42 @@ describe("Figma clipboard payload", () => {
     expect(payload.svg).not.toContain("<script");
   });
 
+  it("anchors every styled text line to an absolute SVG baseline", async () => {
+    const plan = makePlan();
+    const text = plan.root.children[2];
+    if (text?.type !== "TEXT") throw new Error("expected text fixture");
+    text.characters = "First\nSecond";
+    text.height = 48;
+    text.segments = [
+      {
+        start: 0,
+        end: 5,
+        fontFamily: "Inter",
+        fontStyle: "Regular",
+        fontSizePx: 16,
+        color: { r: 0, g: 0, b: 0, a: 1 },
+        letterSpacingPx: 0,
+        textDecoration: "NONE",
+      },
+      {
+        start: 6,
+        end: 12,
+        fontFamily: "Inter",
+        fontStyle: "Semi Bold",
+        fontSizePx: 16,
+        color: { r: 0.2, g: 0.3, b: 0.8, a: 1 },
+        letterSpacingPx: 0,
+        textDecoration: "NONE",
+      },
+    ];
+
+    const svg = await renderPlanToSvg(plan);
+
+    expect(svg).toContain('<tspan x="0" y="16">');
+    expect(svg).toContain('<tspan x="0" y="40">');
+    expect(svg).not.toMatch(/<tspan x="0"\s+dy=/u);
+  });
+
   it("rejects external asset URLs even when an untrusted plan bypasses TypeScript", async () => {
     const plan = makePlan();
     const untrusted = structuredClone(plan) as unknown as {

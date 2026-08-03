@@ -88,7 +88,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(async () => {
         if (message.type === "fetch-asset") return fetchDeclaredAsset(message.url);
         if (message.type === "capture-element-screenshot") {
-          return captureElementScreenshot(message.tabId, message.rect);
+          return captureElementScreenshot(
+            message.tabId,
+            message.rect,
+            message.transparentBackground === true,
+          );
         }
         await controller.handleContentMessage(message, senderIdentity);
         return { ok: true };
@@ -214,9 +218,19 @@ async function fetchDeclaredAsset(url: string): Promise<{
 async function captureElementScreenshot(
   tabId: number,
   rect: { x: number; y: number; width: number; height: number },
+  transparentBackground: boolean,
 ): Promise<{ ok: boolean; dataUrl?: string }> {
   if (!isSafeScreenshotRect(rect)) return { ok: false };
+  let backgroundOverrideApplied = false;
   try {
+    if (transparentBackground) {
+      await platform.sendDebuggerCommand(
+        tabId,
+        "Emulation.setDefaultBackgroundColorOverride",
+        { color: { r: 0, g: 0, b: 0, a: 0 } },
+      );
+      backgroundOverrideApplied = true;
+    }
     const result = (await platform.sendDebuggerCommand(tabId, "Page.captureScreenshot", {
       format: "png",
       fromSurface: true,
@@ -228,6 +242,12 @@ async function captureElementScreenshot(
     return { ok: true, dataUrl: `data:image/png;base64,${result.data}` };
   } catch {
     return { ok: false };
+  } finally {
+    if (backgroundOverrideApplied) {
+      await platform
+        .sendDebuggerCommand(tabId, "Emulation.setDefaultBackgroundColorOverride", {})
+        .catch(() => undefined);
+    }
   }
 }
 
@@ -250,7 +270,11 @@ function isContentMessage(value: unknown): value is ContentMessage {
     case "capture-error":
       return typeof candidate.code === "string";
     case "capture-element-screenshot":
-      return isSafeScreenshotRect(candidate.rect);
+      return (
+        isSafeScreenshotRect(candidate.rect) &&
+        (candidate.transparentBackground === undefined ||
+          typeof candidate.transparentBackground === "boolean")
+      );
     case "fetch-asset":
       return typeof candidate.url === "string";
     default:
